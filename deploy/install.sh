@@ -10,6 +10,7 @@
 #
 # Re-run any time to update to the latest code:   sudo bash /opt/lurkme/deploy/install.sh
 #   --reconfigure   enter the credentials and settings again
+#   --test-discord  send a sample gift alert to the Discord webhook
 #   --uninstall     stop the service and remove the bot and its saved credentials
 #
 # Environment overrides: REPO_URL, BRANCH (which git branch to run).
@@ -324,6 +325,7 @@ Useful commands:
   Restart:           sudo systemctl restart $APP
   Update:            sudo bash $INSTALL_DIR/deploy/install.sh
   New tokens:        sudo bash $INSTALL_DIR/deploy/install.sh --reconfigure
+  Test Discord:      sudo bash $INSTALL_DIR/deploy/install.sh --test-discord
   Uninstall:         sudo bash $INSTALL_DIR/deploy/install.sh --uninstall
 EOF
 }
@@ -349,6 +351,13 @@ main() {
     case ${1:-} in
         "")            ;;
         --reconfigure) reconfigure=true ;;
+        --test-discord)
+            [[ $EUID -eq 0 ]] || die "Run this with sudo."
+            [[ -x $VENV_DIR/bin/python && -f $ENV_FILE ]] || die "Install lurkme first."
+            # Run as the service user, exactly like the service does
+            runuser -u "$SERVICE_USER" -- env LURKME_ENV_FILE="$ENV_FILE" \
+                "$VENV_DIR/bin/python" "$INSTALL_DIR/lurker_bot.py" --test-discord
+            exit ;;
         --uninstall)   [[ $EUID -eq 0 ]] || die "Run this with sudo."; uninstall; exit 0 ;;
         -h|--help)     awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "${BASH_SOURCE[0]}"; exit 0 ;;
         *)             die "Unknown option: $1 (try --help)" ;;

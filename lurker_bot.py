@@ -574,7 +574,27 @@ def run_bot(bot: LurkerBot):
         loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
         loop.close()
 
+def send_test_alert():
+    """`lurker_bot.py --test-discord`: post a sample alert to check the webhook and the @mention."""
+    check_config()
+    if not DISCORD_WEBHOOK_URL:
+        die("[discord] DISCORD_WEBHOOK_URL isn't set — see README.md")
+    sample  = {"channel": "twitch", "room_id": "", "gifter": "lurkme", "plan": "1000", "months": 1, "total": 1,
+               "time": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+    payload = build_gift_alert(sample, "Twitch", None)
+    payload["embeds"][0]["title"] = "🧪 Test alert: gift alerts are working"
+    try:
+        send_discord(payload)
+    except requests.HTTPError as e:
+        die(f"[discord] Discord rejected the test alert (HTTP {getattr(e.response, 'status_code', '?')}) — check DISCORD_WEBHOOK_URL")
+    except OSError as e:
+        die(f"[discord] Couldn't reach Discord ({type(e).__name__})")  # Not str(e): it includes the webhook URL
+    print("[discord] Test alert sent — check your Discord", flush=True)
+
 def main():
+    if sys.argv[1:] == ["--test-discord"]:
+        send_test_alert()
+        return
     if not OAUTH_TOKEN:
         die("OAUTH_TOKEN is not set — see README.md")
 

@@ -97,6 +97,7 @@ Avoid that form on shared machines, because it puts the secrets in your shell hi
 | Check it's running            | `systemctl status lurkme` |
 | Update to the latest code     | `sudo bash /opt/lurkme/deploy/install.sh` |
 | Enter new tokens / settings   | `sudo bash /opt/lurkme/deploy/install.sh --reconfigure` |
+| Send a test Discord alert     | `sudo bash /opt/lurkme/deploy/install.sh --test-discord` |
 | Remove everything             | `sudo bash /opt/lurkme/deploy/install.sh --uninstall` |
 
 Run the bot in only one place at a time. Two copies logged in as the same account would double the join rate and could hit Twitch's limit.
