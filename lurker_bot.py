@@ -56,7 +56,7 @@ DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 DISCORD_USER_ID     = os.getenv("DISCORD_USER_ID", "").strip()  # Numeric ID of the Discord user to @mention
 
 MAX_CHANNELS      = max(0, int(os.getenv("MAX_CHANNELS", "80")))  # 0 = no application cap
-BASE_CHANNELS     = 80
+BASE_CHANNELS     = MAX_CHANNELS or 80  # Fill the configured cap when auto-joins are off
 AUTO_JOIN_MODE    = os.getenv("AUTO_JOIN_MODE", "off").lower()
 AUTO_JOIN_FILE    = os.getenv("AUTO_JOIN_FILE", "/var/lib/lurkme/auto_channels.sqlite3")
 if AUTO_JOIN_MODE not in ("off", "all"):

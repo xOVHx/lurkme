@@ -30,6 +30,29 @@ class FakeBot(module.LurkerBot):
         self.parts.extend(channels)
 
 class BotTests(unittest.IsolatedAsyncioTestCase):
+    async def test_live_follows_first_then_top_fill_refreshes_to_100(self):
+        previous = module.MAX_CHANNELS, module.BASE_CHANNELS, module.JOIN_DELAY, module.CHANNELS
+        module.MAX_CHANNELS, module.BASE_CHANNELS, module.JOIN_DELAY, module.CHANNELS = 100, 100, 0, []
+        try:
+            bot = FakeBot(None)
+            bot.auto_join = None
+            bot.followed = [f"follow{i}" for i in range(40)]
+            bot.top = bot.followed[30:] + [f"top{i}" for i in range(100)]
+            targets = bot._build_target_list()
+            self.assertEqual(targets[:40], bot.followed)
+            self.assertEqual(targets[40:], [f"top{i}" for i in range(60)])
+            await bot._sync_channels()
+            self.assertEqual(len(bot.joined), 100)
+            bot.followed = bot.followed[20:]
+            bot.top = [f"newtop{i}" for i in range(100)]
+            await bot._sync_channels()
+            self.assertEqual(len(bot.joined), 100)
+            self.assertTrue(set(bot.followed) <= bot.joined)
+            self.assertFalse({f"follow{i}" for i in range(20)} & bot.joined)
+            self.assertEqual(bot.joined - set(bot.followed), {f"newtop{i}" for i in range(80)})
+        finally:
+            module.MAX_CHANNELS, module.BASE_CHANNELS, module.JOIN_DELAY, module.CHANNELS = previous
+
     async def test_refresh_and_reconnect_keep_all_persistent_channels(self):
         previous_max, previous_delay = module.MAX_CHANNELS, module.JOIN_DELAY
         module.MAX_CHANNELS, module.JOIN_DELAY = 0, 0
