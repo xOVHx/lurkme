@@ -416,6 +416,11 @@ main() {
     install_packages
     ensure_user
     fetch_code
+    # Bash already holds this (possibly older) installer in memory; continue with the one just downloaded
+    if [[ -z ${LURKME_REEXEC:-} ]] && ! cmp -s "${BASH_SOURCE[0]}" "$INSTALL_DIR/deploy/install.sh"; then
+        say "The installer itself was updated, continuing with the new version"
+        LURKME_REEXEC=1 exec bash "$INSTALL_DIR/deploy/install.sh" "$@"
+    fi
     setup_venv
 
     if $reconfigure || [[ ! -f $ENV_FILE ]]; then
