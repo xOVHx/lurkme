@@ -14,8 +14,8 @@
 #   --uninstall     stop the service and remove the bot and its saved credentials
 #
 # Environment overrides: REPO_URL, BRANCH (which git branch to run).
-# For unattended installs, CLIENT_ID, CLIENT_SECRET, OAUTH_TOKEN, REFRESH_TOKEN, CHANNELS,
-# STREAM_LANGUAGES, CATEGORIES, DISCORD_WEBHOOK_URL and DISCORD_USER_ID are used instead
+# For unattended installs, settings already in the environment (CLIENT_ID, CLIENT_SECRET,
+# OAUTH_TOKEN, REFRESH_TOKEN and the optional ones listed in .env.example) are used instead
 # of prompting (or create /etc/lurkme/lurkme.env first; see .env.example).
 
 set -euo pipefail
@@ -26,6 +26,7 @@ INSTALL_DIR=/opt/lurkme
 VENV_DIR=$INSTALL_DIR/.venv
 ENV_DIR=/etc/lurkme
 ENV_FILE=$ENV_DIR/lurkme.env
+STATE_DIR=/var/lib/lurkme  # systemd's StateDirectory: gift history and stats
 UNIT_FILE=/etc/systemd/system/$APP.service
 DEFAULT_REPO_URL=https://github.com/xOVHx/lurkme.git
 DEFAULT_BRANCH=main
@@ -206,6 +207,9 @@ EOF
     ask CHANNELS         "Channels to always join, comma-separated"  optional '[A-Za-z0-9_#, ]*' "$(current CHANNELS)"
     ask STREAM_LANGUAGES "Stream languages, comma-separated"         optional '[A-Za-z, ]*'      "${langs:-en}"
     ask CATEGORIES       "Categories, comma-separated (blank = all)" optional '[^"\\$`]*'      "$(current CATEGORIES)"
+    local max_channels
+    max_channels=$(current MAX_CHANNELS)
+    ask MAX_CHANNELS     "Max channels (1-100, Twitch's limit)"      optional '([1-9]|[1-9][0-9]|100)' "${max_channels:-100}"
 
     say "Discord gift alerts (optional)"
     cat <<'EOF'
@@ -216,8 +220,36 @@ EOF
     ask DISCORD_WEBHOOK_URL "Webhook URL (blank = no alerts)"        optional-secret \
         'https://([a-z]+\.)?discord(app)?\.com/api/webhooks/[0-9]+/[A-Za-z0-9_-]+' "$(current DISCORD_WEBHOOK_URL)"
     ask DISCORD_USER_ID     "Your Discord user ID (blank = no ping)" optional '[0-9]{15,21}' "$(current DISCORD_USER_ID)"
+    local digest tz
+    digest=$(current DIGEST_TIME)
+    tz=$(current TIMEZONE)
+    ask DIGEST_TIME "Daily digest time, HH:MM or off"           optional '(([01]?[0-9]|2[0-3]):[0-5][0-9]|off)' "${digest:-21:00}"
+    ask TIMEZONE    "Your timezone, e.g. America/New_York"      optional '[A-Za-z]+(/[A-Za-z0-9_+-]+)*' "${tz:-$(system_tz)}"
+
+    say "Web dashboard (optional)"
+    cat <<'EOF'
+  A live page with your channels, gifts and stats. Without a password it's only
+  reachable through an SSH tunnel (safest). With a password it's open on the
+  server's public IP over plain HTTP.
+EOF
+    local port
+    port=$(current DASHBOARD_PORT)
+    ask DASHBOARD_PORT     "Dashboard port (0 = off)"                         optional '[0-9]{1,5}'               "${port:-8787}"
+    ask DASHBOARD_PASSWORD "Dashboard password, 8+ characters (blank = tunnel only)" optional-secret '[^"\\$`[:space:]]{8,}' \
+        "$(current DASHBOARD_PASSWORD)"
+    # shellcheck disable=SC2034  # Read via ${!var} in write_env_file
+    if [[ -n $DASHBOARD_PASSWORD ]]; then DASHBOARD_HOST=0.0.0.0; else DASHBOARD_HOST=127.0.0.1; fi
 
     write_env_file
+}
+
+# The server's timezone name (for the digest prompt's default)
+system_tz() {
+    local tz
+    tz=$(timedatectl show -p Timezone --value 2>/dev/null || true)
+    [[ -z $tz && -f /etc/timezone ]] && tz=$(head -n 1 /etc/timezone)
+    [[ -z $tz && -L /etc/localtime ]] && tz=$(readlink /etc/localtime | sed 's|.*/zoneinfo/||')
+    printf '%s' "${tz:-UTC}"
 }
 
 write_env_file() {
@@ -226,8 +258,9 @@ write_env_file() {
     tmp=$(mktemp "$ENV_DIR/.lurkme.env.XXXXXX")
     {
         echo "# lurkme settings, written by deploy/install.sh. Edit, then: sudo systemctl restart $APP"
-        for var in CLIENT_ID CLIENT_SECRET OAUTH_TOKEN REFRESH_TOKEN CHANNELS STREAM_LANGUAGES CATEGORIES \
-                   DISCORD_WEBHOOK_URL DISCORD_USER_ID; do
+        for var in CLIENT_ID CLIENT_SECRET OAUTH_TOKEN REFRESH_TOKEN CHANNELS STREAM_LANGUAGES CATEGORIES MAX_CHANNELS \
+                   DISCORD_WEBHOOK_URL DISCORD_USER_ID DIGEST_TIME TIMEZONE \
+                   DASHBOARD_PORT DASHBOARD_PASSWORD DASHBOARD_HOST; do
             printf '%s="%s"\n' "$var" "${!var:-}"
         done
     } >"$tmp"
@@ -256,6 +289,9 @@ Environment=LURKME_ENV_FILE=$ENV_FILE
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONDONTWRITEBYTECODE=1
 ExecStart=$VENV_DIR/bin/python $INSTALL_DIR/lurker_bot.py
+# Gift history and stats live here (the rest of the filesystem is read-only to the bot)
+StateDirectory=$APP
+StateDirectoryMode=0700
 
 # Restart on any crash, but not when the bot says its credentials need fixing
 Restart=always
@@ -317,6 +353,18 @@ start_service() {
 }
 
 print_help() {
+    local port host
+    port=$(current DASHBOARD_PORT)
+    host=$(current DASHBOARD_HOST)
+    if [[ ${port:-0} != 0 ]]; then
+        echo
+        if [[ $host == 0.0.0.0 ]]; then
+            say "Dashboard: http://<this server's IP>:$port (password protected; the SSH tunnel below is safer)"
+        else
+            say "Dashboard: from your computer run  ssh -L $port:localhost:$port <you>@<this server>"
+            echo "    then open http://localhost:$port in your browser."
+        fi
+    fi
     cat <<EOF
 
 Useful commands:
@@ -332,14 +380,14 @@ EOF
 
 uninstall() {
     local reply
-    read -r -p "Remove lurkme, its service and its saved credentials? [y/N] " reply
+    read -r -p "Remove lurkme, its service, saved credentials and gift stats? [y/N] " reply
     [[ $reply == [yY]* ]] || die "Cancelled."
     if has_systemd; then
         systemctl disable --now --quiet "$APP" 2>/dev/null || true
     fi
     rm -f "$UNIT_FILE"
     has_systemd && systemctl daemon-reload
-    rm -rf "$INSTALL_DIR" "$ENV_DIR"
+    rm -rf "$INSTALL_DIR" "$ENV_DIR" "$STATE_DIR"
     id -u "$SERVICE_USER" >/dev/null 2>&1 && userdel "$SERVICE_USER"
     say "lurkme has been removed"
 }

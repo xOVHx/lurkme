@@ -1,8 +1,16 @@
 # lurkme
 
 Twitch chat lurker bot. It joins your pinned channels and live followed channels,
-fills up to 80 channels with the top live streams, and logs any subs gifted to you.
+fills up to 100 channels (Twitch's limit) with the top live streams, and logs any subs gifted to you.
 The channel list is refreshed every 30 minutes, and channels that drop out are left.
+
+- **Gift alerts on Discord.** Each one is a card with the streamer's avatar, the gifter, tier and length, and your all-time count, and it pings you.
+- **Gift-drop stats.** The bot records every community gift drop in the chats it's in, so you can see how many subs
+  were given out around you, which channels drop the most, and your odds ("you win about 1 in 40 drops").
+- **Daily digest** on Discord, and a red **needs-you alert** if the bot ever stops because its credentials died.
+- **Live web dashboard.** It shows the channels you're in (stream previews, game, viewers, how long you've lurked),
+  recent gifts, drop stats, and bot health.
+- Stats are kept in a small database, so they survive restarts and updates.
 
 Being in chat earns third-party bot points (StreamElements, Nightbot, etc.).
 It does **not** earn official Channel Points or watch time, because those need the video player open.
@@ -52,20 +60,34 @@ Set these the same way as the variables above. Each takes a comma-separated list
 
 | Variable           | Default | What it does |
 |--------------------|---------|--------------|
-| `CHANNELS`         | none    | Channels to always join, live or not, e.g. `streamer1, streamer2`. They get priority and count toward the 80. |
+| `CHANNELS`         | none    | Channels to always join, live or not, e.g. `streamer1, streamer2`. They get priority and count toward `MAX_CHANNELS`. |
 | `STREAM_LANGUAGES` | `en`    | Languages for the top-streams fill, as two-letter codes, e.g. `en, es`. Use `any` for all languages. |
 | `CATEGORIES`       | all     | Only fill from these categories, e.g. `Just Chatting, Fortnite`. Use the exact name shown on Twitch. |
+| `MAX_CHANNELS`     | `100`   | How many chats to be in. 100 is Twitch's limit per account. Lower it if you also chat on this account yourself, because your own chats count toward the same 100. |
 
-Channels are picked in this order: `CHANNELS`, then your live followed channels, then top streams, up to 80 in total.
+Channels are picked in this order: `CHANNELS`, then your live followed channels, then top streams, up to `MAX_CHANNELS` in total.
 
-### Discord gift alerts
+### Discord alerts
 
 | Variable              | What it does |
 |-----------------------|--------------|
 | `DISCORD_WEBHOOK_URL` | Posts a card to this Discord webhook whenever someone gifts you a sub: the channel and its avatar, who gifted it, the tier and the length. Create one under Server Settings → Integrations → Webhooks. Keep it private, because anyone with the URL can post to that channel. |
 | `DISCORD_USER_ID`     | Pings you in each alert. This must be your numeric user ID, because a webhook can't ping by username. To find it, turn on Settings → Advanced → Developer Mode, then right-click your name → Copy User ID. |
+| `DIGEST_TIME`         | When to post the daily digest: gifts won, drops seen, your odds, top channels for gift drops, and lurk time. Default `21:00`; `off` disables it. |
+| `TIMEZONE`            | Timezone for `DIGEST_TIME`, e.g. `America/New_York`. Default: the server's. |
 
+With a webhook set, the bot also posts a green "online" card when it comes back after more than 10 minutes of downtime. If it ever stops because its credentials died, it posts a red card that pings you, with the exact command to fix it.
 Alerts are sent in the background and retried if Discord is down or rate-limited. If the bot restarts, unsent alerts carry over to the next run.
+
+### Dashboard
+
+| Variable             | Default     | What it does |
+|----------------------|-------------|--------------|
+| `DASHBOARD_PORT`     | `8787`      | Port for the live dashboard. `0` or `off` disables it. |
+| `DASHBOARD_PASSWORD` | none        | Without one, the dashboard only listens on the server itself. Open it through an SSH tunnel: `ssh -L 8787:localhost:8787 you@your-server`, then browse to <http://localhost:8787>. With a password, it also listens on the server's public IP, behind a browser login prompt. That traffic is plain HTTP, so the tunnel is safer. |
+| `DASHBOARD_HOST`     | `127.0.0.1` | Where to listen. Anything other than localhost requires `DASHBOARD_PASSWORD`. The installer sets this for you. |
+
+Stats are stored in `/var/lib/lurkme/lurkme.db` on a VPS (or `data/` next to the script when run locally).
 
 ## Run it on a VPS
 
@@ -113,7 +135,7 @@ Run the bot in only one place at a time. Two copies logged in as the same accoun
 ## Rate limits
 
 Twitch allows an account to be in at most 100 chats at once (channels it moderates don't count).
-The bot stays in at most 80, which leaves room for chats you open yourself on the same account.
+By default the bot uses all 100. If you also chat on the same account, set `MAX_CHANNELS` lower so the total stays under 100.
 JOINs are paced at about 17 per 10 seconds, under Twitch's limit of 20.
 The bot never sends chat messages.
 It makes a few API calls every 30 minutes, far below Twitch's API limits.
