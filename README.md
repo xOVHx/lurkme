@@ -1,7 +1,7 @@
 # lurkme
 
-Twitch chat lurker bot. It joins your live followed channels, fills up to 80
-channels with the top live English streams, and logs any subs gifted to you.
+Twitch chat lurker bot. It joins your pinned channels and live followed channels,
+fills up to 80 channels with the top live streams, and logs any subs gifted to you.
 The channel list is refreshed every 30 minutes, and channels that drop out are left.
 
 Being in chat earns third-party bot points (StreamElements, Nightbot, etc.).
@@ -45,6 +45,18 @@ It does **not** earn official Channel Points or watch time, because those need t
    ```
 
 Never commit real credentials. `.env` is gitignored.
+
+## Optional settings
+
+Set these the same way as the variables above. Each takes a comma-separated list.
+
+| Variable           | Default | What it does |
+|--------------------|---------|--------------|
+| `CHANNELS`         | none    | Channels to always join, live or not, e.g. `streamer1, streamer2`. They get priority and count toward the 80. |
+| `STREAM_LANGUAGES` | `en`    | Languages for the top-streams fill, as two-letter codes, e.g. `en, es`. Use `any` for all languages. |
+| `CATEGORIES`       | all     | Only fill from these categories, e.g. `Just Chatting, Fortnite`. Use the exact name shown on Twitch. |
+
+Channels are picked in this order: `CHANNELS`, then your live followed channels, then top streams, up to 80 in total.
 
 ## Keeping it running
 

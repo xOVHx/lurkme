@@ -1,8 +1,9 @@
 """
 Twitch Lurker Bot
 -----------------
-Joins your live followed channels, then fills up to 80 channels with the
-top live EN streamers. Tracks gifted subs received in chat.
+Joins your pinned channels and live followed channels, then fills up to 80
+channels with the top live streams (EN by default, optionally filtered by
+category). Tracks gifted subs received in chat.
 
 Note: Official Twitch Channel Points and Watch Hours require
 the video player to be open — chat presence alone does not count.
@@ -22,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+import re
 import sys
 import time
 
@@ -38,8 +40,15 @@ CLIENT_SECRET = os.getenv("CLIENT_SECRET", "")
 OAUTH_TOKEN   = os.getenv("OAUTH_TOKEN", "")
 REFRESH_TOKEN = os.getenv("REFRESH_TOKEN", "")
 
+def _env_list(name: str) -> list[str]:
+    return [item.strip() for item in os.getenv(name, "").split(",") if item.strip()]
+
+# Optional, comma-separated — see README.md
+CHANNELS   = list(dict.fromkeys(c.lower().lstrip("#") for c in _env_list("CHANNELS")))  # Always joined
+LANGUAGES  = [lang.lower() for lang in _env_list("STREAM_LANGUAGES")] or ["en"]         # Top-stream fill; "any" = all
+CATEGORIES = _env_list("CATEGORIES")                                                    # Top-stream fill; exact Twitch names
+
 MAX_CHANNELS      = 80
-LANGUAGE          = "en"
 JOIN_DELAY        = 0.6    # Twitch allows 20 JOINs per 10 seconds
 REFRESH_INTERVAL  = 1800   # Seconds between channel list refreshes
 VALIDATE_INTERVAL = 3600   # Twitch requires validating user tokens hourly
@@ -54,6 +63,9 @@ HTTP_TIMEOUT      = 10
 
 SCOPE_CHAT    = "chat:read"
 SCOPE_FOLLOWS = "user:read:follows"
+
+LOGIN_RE    = re.compile(r"[a-z0-9_]{1,25}")
+LANGUAGE_RE = re.compile(r"[a-z]{2}|other|any")
 
 HELIX_URL    = "https://api.twitch.tv/helix"
 TOKEN_URL    = "https://id.twitch.tv/oauth2/token"
@@ -110,6 +122,21 @@ def get_valid_token(token: str, refresh_token: str, can_refresh: bool) -> tuple[
             time.sleep(delay)
             delay = min(delay * 2, RESTART_DELAY_MAX)
 
+def check_config():
+    """Drop malformed CHANNELS / STREAM_LANGUAGES entries with a warning, then log the channel mix."""
+    global CHANNELS, LANGUAGES
+    for name, values, pattern in (("CHANNELS", CHANNELS, LOGIN_RE), ("STREAM_LANGUAGES", LANGUAGES, LANGUAGE_RE)):
+        bad = [v for v in values if not pattern.fullmatch(v)]
+        if bad:
+            print(f"[config] Ignoring invalid {name}: {', '.join(bad)}", flush=True)
+    CHANNELS  = [c for c in CHANNELS if LOGIN_RE.fullmatch(c)]
+    LANGUAGES = [lang for lang in LANGUAGES if LANGUAGE_RE.fullmatch(lang)] or ["en"]
+    if len(CHANNELS) > MAX_CHANNELS:
+        print(f"[config] Only the first {MAX_CHANNELS} CHANNELS fit — the rest are ignored", flush=True)
+
+    print(f"[config] Pinned: {len(CHANNELS)}  |  Languages: {', '.join(LANGUAGES)}"
+          f"  |  Categories: {', '.join(CATEGORIES) or 'all'}", flush=True)
+
 def check_token(info: dict, can_refresh: bool) -> bool:
     """Exit if the token can't join chat, warn about anything that limits the bot. Returns can_refresh."""
     scopes = info.get("scopes") or []
@@ -155,6 +182,7 @@ class LurkerBot(commands.Bot):
         self._check_token  = asyncio.Event()
         self._run_task: asyncio.Task | None = None
         self._tasks: list[asyncio.Task] = []
+        self._category_ids: list[str] | None = None if CATEGORIES else []
 
     # ── Display ───────────────────────────────────────────────────────────────
 
@@ -252,7 +280,7 @@ class LurkerBot(commands.Bot):
 
     # ── API helpers ───────────────────────────────────────────────────────────
 
-    def _helix_get(self, path: str, params: dict) -> dict:
+    def _helix_get(self, path: str, params: dict | list[tuple]) -> dict:
         resp = requests.get(
             f"{HELIX_URL}/{path}",
             headers={"Client-ID": self.api_client_id, "Authorization": f"Bearer {self.user_token}"},
@@ -274,19 +302,39 @@ class LurkerBot(commands.Bot):
             if not cursor or len(logins) >= MAX_CHANNELS:
                 return logins
 
+    def _get_category_ids(self) -> list[str]:
+        if self._category_ids is None:  # Resolve CATEGORIES names once per run
+            data  = self._helix_get("games", [("name", name) for name in CATEGORIES])
+            found = {g["name"].lower(): g["id"] for g in data.get("data", [])}
+            missing = [name for name in CATEGORIES if name.lower() not in found]
+            if missing:
+                self._log(f"[config] Unknown CATEGORIES (use the exact Twitch name): {', '.join(missing)}")
+            if not found:
+                self._log("[config] No CATEGORIES matched — filling from all categories")
+            self._category_ids = list(found.values())
+        return self._category_ids
+
     def _get_top_streamers(self) -> list[str]:
-        data = self._helix_get("streams", {"first": 100, "language": LANGUAGE})
+        params = [("first", 100)]
+        if "any" not in LANGUAGES:
+            params += [("language", lang) for lang in LANGUAGES]
+        params += [("game_id", gid) for gid in self._get_category_ids()]
+        data = self._helix_get("streams", params)
         return [s["user_login"] for s in data.get("data", [])]
 
     # ── Channel management ────────────────────────────────────────────────────
 
     def _build_target_list(self) -> list[str]:
-        followed = list(dict.fromkeys(self._get_live_followed_channels())) if self.has_follows else []
-        top      = self._get_top_streamers() if len(followed) < MAX_CHANNELS else []
+        """Pinned channels first, then live followed channels, then top streams to fill."""
+        followed = self._get_live_followed_channels() if self.has_follows else []
+        mine     = list(dict.fromkeys(CHANNELS + followed))
+        top      = self._get_top_streamers() if len(mine) < MAX_CHANNELS else []
 
-        merged     = list(dict.fromkeys(followed + top))[:MAX_CHANNELS]
-        n_followed = min(len(followed), MAX_CHANNELS)
-        self._log(f"[sync] {n_followed} followed live  |  {len(merged) - n_followed} top streamers to fill")
+        merged     = list(dict.fromkeys(mine + top))[:MAX_CHANNELS]
+        n_pinned   = min(len(CHANNELS), MAX_CHANNELS)
+        n_followed = min(len(mine), MAX_CHANNELS) - n_pinned
+        self._log(f"[sync] {n_pinned} pinned  |  {n_followed} followed live  |  "
+                  f"{len(merged) - n_pinned - n_followed} top streams to fill")
         return merged
 
     async def _join(self, channel: str) -> bool:
@@ -405,6 +453,7 @@ def main():
         except AuthError as e:
             raise SystemExit(f"[auth] {e} — see README.md")
         if not checked:
+            check_config()
             can_refresh = check_token(info, can_refresh)
             checked     = True
 
