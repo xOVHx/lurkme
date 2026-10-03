@@ -58,6 +58,15 @@ Set these the same way as the variables above. Each takes a comma-separated list
 
 Channels are picked in this order: `CHANNELS`, then your live followed channels, then top streams, up to 80 in total.
 
+### Discord gift alerts
+
+| Variable              | What it does |
+|-----------------------|--------------|
+| `DISCORD_WEBHOOK_URL` | Posts a card to this Discord webhook whenever someone gifts you a sub: the channel and its avatar, who gifted it, the tier and the length. Create one under Server Settings → Integrations → Webhooks. Keep it private, because anyone with the URL can post to that channel. |
+| `DISCORD_USER_ID`     | Pings you in each alert. This must be your numeric user ID, because a webhook can't ping by username. To find it, turn on Settings → Advanced → Developer Mode, then right-click your name → Copy User ID. |
+
+Alerts are sent in the background and retried if Discord is down or rate-limited. If the bot restarts, unsent alerts carry over to the next run.
+
 ## Run it on a VPS
 
 On any Linux VPS with systemd (Ubuntu, Debian, Fedora, etc.), connect over SSH and run:

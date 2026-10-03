@@ -13,8 +13,9 @@
 #   --uninstall     stop the service and remove the bot and its saved credentials
 #
 # Environment overrides: REPO_URL, BRANCH (which git branch to run).
-# For unattended installs, CLIENT_ID, CLIENT_SECRET, OAUTH_TOKEN, REFRESH_TOKEN,
-# CHANNELS, STREAM_LANGUAGES and CATEGORIES are used instead of prompting.
+# For unattended installs, CLIENT_ID, CLIENT_SECRET, OAUTH_TOKEN, REFRESH_TOKEN, CHANNELS,
+# STREAM_LANGUAGES, CATEGORIES, DISCORD_WEBHOOK_URL and DISCORD_USER_ID are used instead
+# of prompting (or create /etc/lurkme/lurkme.env first; see .env.example).
 
 set -euo pipefail
 
@@ -145,30 +146,30 @@ current() {
     trim "$(sed -n "s/^$1=\"\{0,1\}\([^\"]*\)\"\{0,1\}[[:space:]]*\$/\1/p" "$ENV_FILE" | tail -n 1)"
 }
 
-# ask VAR "Prompt" plain|secret|optional PATTERN [DEFAULT]
+# ask VAR "Prompt" plain|secret|optional|optional-secret PATTERN [DEFAULT]
 # Takes $VAR from the environment if set, otherwise prompts (Enter = DEFAULT).
 # Without a terminal it uses the default, and fails only if a required value is missing.
 ask() {
     local var=$1 prompt=$2 kind=$3 pattern=$4 default=${5:-} value=${!1:-} hint=
     if [[ -n $default ]]; then
-        if [[ $kind == secret ]]; then hint=" [Enter keeps the current one]"; else hint=" [$default]"; fi
+        if [[ $kind == *secret ]]; then hint=" [Enter keeps the current one]"; else hint=" [$default]"; fi
     fi
     while :; do
         if [[ -z $value ]]; then
             if [[ ! -t 0 ]]; then
                 value=$default
             else
-                if [[ $kind == secret ]]; then
+                if [[ $kind == *secret ]]; then
                     read -r -s -p "  $prompt$hint: " value; echo
                 else
                     read -r -p "  $prompt$hint: " value
                 fi
                 value=$(trim "$value")
                 [[ -z $value ]] && value=$default
-                [[ $kind == optional && $value == - ]] && value=  # "-" clears an optional setting
+                [[ $kind == optional* && $value == - ]] && value=  # "-" clears an optional setting
             fi
         fi
-        if [[ -z $value && $kind != optional ]]; then
+        if [[ -z $value && $kind != optional* ]]; then
             [[ -t 0 ]] || die "$var isn't set and there's no terminal to ask for it. Run the installer from an interactive SSH session."
             echo "    This one is required."
         elif [[ -z $value || $value =~ ^$pattern$ ]]; then
@@ -176,7 +177,7 @@ ask() {
             return 0
         else
             if [[ ! -t 0 ]]; then
-                [[ $kind == secret ]] && die "$var has an invalid value."  # Never print a secret
+                [[ $kind == *secret ]] && die "$var has an invalid value."  # Never print a secret
                 die "$var has an invalid value: $value"
             fi
             echo "    That doesn't look right, try again."
@@ -205,6 +206,16 @@ EOF
     ask STREAM_LANGUAGES "Stream languages, comma-separated"         optional '[A-Za-z, ]*'      "${langs:-en}"
     ask CATEGORIES       "Categories, comma-separated (blank = all)" optional '[^"\\$`]*'      "$(current CATEGORIES)"
 
+    say "Discord gift alerts (optional)"
+    cat <<'EOF'
+  Paste a channel webhook URL (Server Settings > Integrations > Webhooks) to get a
+  message whenever someone gifts you a sub. To be pinged, add your numeric user ID:
+  Settings > Advanced > Developer Mode on, then right-click your name > Copy User ID.
+EOF
+    ask DISCORD_WEBHOOK_URL "Webhook URL (blank = no alerts)"        optional-secret \
+        'https://([a-z]+\.)?discord(app)?\.com/api/webhooks/[0-9]+/[A-Za-z0-9_-]+' "$(current DISCORD_WEBHOOK_URL)"
+    ask DISCORD_USER_ID     "Your Discord user ID (blank = no ping)" optional '[0-9]{15,21}' "$(current DISCORD_USER_ID)"
+
     write_env_file
 }
 
@@ -214,7 +225,8 @@ write_env_file() {
     tmp=$(mktemp "$ENV_DIR/.lurkme.env.XXXXXX")
     {
         echo "# lurkme settings, written by deploy/install.sh. Edit, then: sudo systemctl restart $APP"
-        for var in CLIENT_ID CLIENT_SECRET OAUTH_TOKEN REFRESH_TOKEN CHANNELS STREAM_LANGUAGES CATEGORIES; do
+        for var in CLIENT_ID CLIENT_SECRET OAUTH_TOKEN REFRESH_TOKEN CHANNELS STREAM_LANGUAGES CATEGORIES \
+                   DISCORD_WEBHOOK_URL DISCORD_USER_ID; do
             printf '%s="%s"\n' "$var" "${!var:-}"
         done
     } >"$tmp"

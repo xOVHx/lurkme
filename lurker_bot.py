@@ -27,6 +27,7 @@ import os
 import re
 import sys
 import time
+from datetime import datetime, timezone
 
 import requests
 from dotenv import load_dotenv
@@ -49,6 +50,10 @@ CHANNELS   = list(dict.fromkeys(c.lower().lstrip("#") for c in _env_list("CHANNE
 LANGUAGES  = [lang.lower() for lang in _env_list("STREAM_LANGUAGES")] or ["en"]         # Top-stream fill; "any" = all
 CATEGORIES = _env_list("CATEGORIES")                                                    # Top-stream fill; exact Twitch names
 
+# Optional gift alerts. The webhook URL is a secret: anyone who has it can post to the channel.
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
+DISCORD_USER_ID     = os.getenv("DISCORD_USER_ID", "").strip()  # Numeric ID of the Discord user to @mention
+
 MAX_CHANNELS      = 80
 JOIN_DELAY        = 0.6    # Twitch allows 20 JOINs per 10 seconds
 REFRESH_INTERVAL  = 1800   # Seconds between channel list refreshes
@@ -68,6 +73,8 @@ SCOPE_FOLLOWS = "user:read:follows"
 
 LOGIN_RE    = re.compile(r"[a-z0-9_]{1,25}")
 LANGUAGE_RE = re.compile(r"[a-z]{2}|other|any")
+WEBHOOK_RE  = re.compile(r"https://(?:(?:canary|ptb)\.)?discord(?:app)?\.com/api/webhooks/\d+/[\w-]+")
+USER_ID_RE  = re.compile(r"\d{15,21}")
 
 HELIX_URL    = "https://api.twitch.tv/helix"
 TOKEN_URL    = "https://id.twitch.tv/oauth2/token"
@@ -131,7 +138,7 @@ def get_valid_token(token: str, refresh_token: str, can_refresh: bool) -> tuple[
 
 def check_config():
     """Drop malformed CHANNELS / STREAM_LANGUAGES entries with a warning, then log the channel mix."""
-    global CHANNELS, LANGUAGES
+    global CHANNELS, LANGUAGES, DISCORD_WEBHOOK_URL, DISCORD_USER_ID
     for name, values, pattern in (("CHANNELS", CHANNELS, LOGIN_RE), ("STREAM_LANGUAGES", LANGUAGES, LANGUAGE_RE)):
         bad = [v for v in values if not pattern.fullmatch(v)]
         if bad:
@@ -141,8 +148,68 @@ def check_config():
     if len(CHANNELS) > MAX_CHANNELS:
         print(f"[config] Only the first {MAX_CHANNELS} CHANNELS fit — the rest are ignored", flush=True)
 
+    if DISCORD_WEBHOOK_URL and not WEBHOOK_RE.fullmatch(DISCORD_WEBHOOK_URL):
+        print("[config] Ignoring DISCORD_WEBHOOK_URL — it isn't a Discord webhook URL", flush=True)  # Never print it
+        DISCORD_WEBHOOK_URL = ""
+    if DISCORD_USER_ID and not USER_ID_RE.fullmatch(DISCORD_USER_ID):
+        print("[config] Ignoring DISCORD_USER_ID — it must be the numeric user ID, not a username (see README.md)", flush=True)
+        DISCORD_USER_ID = ""
+
+    discord = ("on, mentioning you" if DISCORD_USER_ID else "on") if DISCORD_WEBHOOK_URL else "off"
     print(f"[config] Pinned: {len(CHANNELS)}  |  Languages: {', '.join(LANGUAGES)}"
-          f"  |  Categories: {', '.join(CATEGORIES) or 'all'}", flush=True)
+          f"  |  Categories: {', '.join(CATEGORIES) or 'all'}  |  Discord alerts: {discord}", flush=True)
+
+# ── Discord gift alerts ───────────────────────────────────────────────────────
+
+TWITCH_PURPLE = 0x9146FF
+SUB_TIERS     = {"1000": "Tier 1", "2000": "Tier 2", "3000": "Tier 3", "Prime": "Prime"}
+
+def _md(text: str) -> str:
+    """Escape Discord markdown so names like some_streamer_ render as typed."""
+    return re.sub(r"([\\*_~`|>\[\]()])", r"\\\1", text)
+
+def build_gift_alert(gift: dict, channel_name: str, avatar_url: str | None) -> dict:
+    """The webhook payload for one gifted sub: an @mention plus an embed card."""
+    url    = f"https://www.twitch.tv/{gift['channel']}"
+    tier   = SUB_TIERS.get(gift["plan"], "Tier 1")
+    months = gift["months"]
+    embed  = {
+        "author":      {"name": f"{channel_name} on Twitch", "url": url},
+        "title":       "🎁 You got a gifted sub!",
+        "url":         url,
+        "description": f"**{_md(gift['gifter'])}** gifted you a sub in **[{_md(channel_name)}]({url})**",
+        "color":       TWITCH_PURPLE,
+        "fields": [
+            {"name": "Tier",   "value": tier, "inline": True},
+            {"name": "Length", "value": f"{months} months" if months > 1 else "1 month", "inline": True},
+            {"name": "Total",  "value": f"#{gift['total']} since the bot started", "inline": True},
+        ],
+        "footer":      {"text": "lurkme"},
+        "timestamp":   gift["time"],
+    }
+    if avatar_url:
+        embed["author"]["icon_url"] = avatar_url
+        embed["thumbnail"]          = {"url": avatar_url}
+
+    payload = {"username": "lurkme", "embeds": [embed], "allowed_mentions": {"parse": []}}
+    if DISCORD_USER_ID:
+        payload["content"]          = f"<@{DISCORD_USER_ID}>"
+        payload["allowed_mentions"] = {"users": [DISCORD_USER_ID]}  # Ping only you, nothing else
+    return payload
+
+def send_discord(payload: dict):
+    """POST to the webhook, waiting out rate limits. Raises requests errors (whose text includes the URL — don't log it)."""
+    for _ in range(5):
+        resp = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=HTTP_TIMEOUT)
+        if resp.status_code != 429:
+            resp.raise_for_status()
+            return
+        try:
+            wait = float(resp.json()["retry_after"])
+        except (ValueError, KeyError, TypeError):
+            wait = 2.0
+        time.sleep(min(wait, 60))
+    raise requests.HTTPError(response=resp)
 
 def check_token(info: dict, can_refresh: bool) -> bool:
     """Exit if the token can't join chat, warn about anything that limits the bot. Returns can_refresh."""
@@ -167,7 +234,8 @@ class LurkerBot(commands.Bot):
     # Don't dispatch an event for every chat message — only USERNOTICEs matter here
     event_message = None
 
-    def __init__(self, token: str, refresh_token: str, token_info: dict, can_refresh: bool, gifted_subs: int = 0):
+    def __init__(self, token: str, refresh_token: str, token_info: dict, can_refresh: bool,
+                 gifted_subs: int = 0, pending_alerts: list[dict] | None = None):
         super().__init__(token=token, prefix="!", initial_channels=[])
         # twitchio keeps every chatter it sees until the channel is parted, which
         # leaks memory across 80 busy chats. Nothing here reads that cache.
@@ -190,6 +258,10 @@ class LurkerBot(commands.Bot):
         self._run_task: asyncio.Task | None = None
         self._tasks: list[asyncio.Task] = []
         self._category_ids: list[str] | None = None if CATEGORIES else []
+        self.alerts: asyncio.Queue[dict] = asyncio.Queue()  # Gift alerts waiting for Discord
+        self._alert_in_flight: dict | None = None
+        for gift in pending_alerts or []:
+            self.alerts.put_nowait(gift)
 
     # ── Display ───────────────────────────────────────────────────────────────
 
@@ -216,6 +288,8 @@ class LurkerBot(commands.Bot):
             asyncio.create_task(self._periodic_refresh()),
             asyncio.create_task(self._watchdog()),
         ]
+        if DISCORD_WEBHOOK_URL:
+            self._tasks.append(asyncio.create_task(self._send_alerts()))
         await super().start()
 
     async def _stop(self, reason: str, fatal: bool):
@@ -415,11 +489,68 @@ class LurkerBot(commands.Bot):
         self._log(f"[join] Timed out joining #{channel}")
 
     async def event_raw_usernotice(self, channel, tags: dict):
-        if tags.get("msg-id") in ("subgift", "anonsubgift"):
-            if tags.get("msg-param-recipient-id") == self.account_id:
-                gifter = tags.get("display-name") or "someone"
-                self.gifted_subs += 1
-                self._log(f"[gift] {gifter} gifted you a sub in #{channel.name}! (total: {self.gifted_subs})")
+        msg_id = tags.get("msg-id")
+        if msg_id not in ("subgift", "anonsubgift") or tags.get("msg-param-recipient-id") != self.account_id:
+            return
+        anonymous = msg_id == "anonsubgift" or tags.get("login") == "ananonymousgifter"
+        gifter    = "An anonymous gifter" if anonymous else (tags.get("display-name") or tags.get("login") or "Someone")
+        self.gifted_subs += 1
+        self._log(f"[gift] {gifter} gifted you a sub in #{channel.name}! (total: {self.gifted_subs})")
+
+        if DISCORD_WEBHOOK_URL:
+            months = tags.get("msg-param-gift-months", "1")
+            self.alerts.put_nowait({
+                "channel": channel.name,
+                "room_id": tags.get("room-id", ""),
+                "gifter":  gifter,
+                "plan":    tags.get("msg-param-sub-plan", "1000"),
+                "months":  int(months) if months.isdigit() else 1,
+                "total":   self.gifted_subs,
+                "time":    datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            })
+
+    # ── Discord ───────────────────────────────────────────────────────────────
+
+    def pending_alerts(self) -> list[dict]:
+        """Alerts not yet delivered, including one cut off mid-send — handed to the next run on restart."""
+        pending = [self._alert_in_flight] if self._alert_in_flight else []
+        while not self.alerts.empty():
+            pending.append(self.alerts.get_nowait())
+        return pending
+
+    def _channel_card(self, gift: dict) -> tuple[str, str | None]:
+        """The channel's display name and avatar for the alert. Best effort: falls back to the login name."""
+        try:
+            users = self._helix_get("users", {"id": gift["room_id"]}).get("data", []) if gift["room_id"] else []
+            if users:
+                return users[0].get("display_name") or gift["channel"], users[0].get("profile_image_url") or None
+        except Exception:
+            pass
+        return gift["channel"], None
+
+    async def _send_alerts(self):
+        while True:
+            gift = self._alert_in_flight = await self.alerts.get()
+            payload = build_gift_alert(gift, *await asyncio.to_thread(self._channel_card, gift))
+            for attempt in range(1, 6):
+                try:
+                    await asyncio.to_thread(send_discord, payload)
+                    self._log(f"[discord] Gift alert sent for #{gift['channel']}")
+                    break
+                except requests.HTTPError as e:
+                    status = getattr(e.response, "status_code", None)
+                    if status and 400 <= status < 500 and status != 429:
+                        self._log(f"[discord] Webhook rejected the alert (HTTP {status}) — check DISCORD_WEBHOOK_URL")
+                        break
+                    problem = f"HTTP {status}"
+                except Exception as e:
+                    problem = type(e).__name__  # Not str(e): requests errors include the webhook URL
+                delay = min(RETRY_DELAY, 5 * 2 ** attempt)
+                self._log(f"[discord] Couldn't send gift alert ({problem}), retry {attempt}/5 in {delay}s")
+                await asyncio.sleep(delay)
+            else:
+                self._log(f"[discord] Gave up on the gift alert for #{gift['channel']}")
+            self._alert_in_flight = None
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
@@ -451,6 +582,7 @@ def main():
     refresh_token = REFRESH_TOKEN
     can_refresh   = bool(CLIENT_ID and CLIENT_SECRET and REFRESH_TOKEN)
     gifted_subs   = 0
+    alerts        = []
     delay         = RESTART_DELAY_MIN
     checked       = False
 
@@ -465,7 +597,7 @@ def main():
             checked     = True
 
         asyncio.set_event_loop(asyncio.new_event_loop())  # Each run gets a fresh loop
-        bot     = LurkerBot(token, refresh_token, info, can_refresh, gifted_subs)
+        bot     = LurkerBot(token, refresh_token, info, can_refresh, gifted_subs, alerts)
         started = time.monotonic()
         run_bot(bot)
         if bot.fatal:
@@ -473,6 +605,7 @@ def main():
 
         # Carry state into the next run — the token may have been refreshed meanwhile
         token, refresh_token, gifted_subs = bot.user_token, bot.refresh_token, bot.gifted_subs
+        alerts = bot.pending_alerts()
         if time.monotonic() - started >= HEALTHY_RUN:
             delay = RESTART_DELAY_MIN
         print(f"[main] Restarting in {delay}s...", flush=True)
