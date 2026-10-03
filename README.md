@@ -27,8 +27,8 @@ It does **not** earn official Channel Points or watch time, because those need t
    > generator such as twitchtokengenerator.com belongs to that site's app. The bot
    > can't renew it, so it will stop when the token expires, usually within a few hours.
 
-3. **Set the environment variables.** On Railway, add them under the service's **Variables**.
-   For local runs, copy `.env.example` to `.env` and fill it in:
+3. **Enter them.** On a VPS, the installer asks for them (see [Run it on a VPS](#run-it-on-a-vps)).
+   To run it on your own computer, copy `.env.example` to `.env` and fill it in:
 
    | Variable        | Value                                 |
    |-----------------|---------------------------------------|
@@ -58,13 +58,47 @@ Set these the same way as the variables above. Each takes a comma-separated list
 
 Channels are picked in this order: `CHANNELS`, then your live followed channels, then top streams, up to 80 in total.
 
+## Run it on a VPS
+
+On any Linux VPS with systemd (Ubuntu, Debian, Fedora, etc.), connect over SSH and run:
+
+```sh
+git clone https://github.com/xOVHx/lurkme.git
+sudo bash lurkme/deploy/install.sh
+```
+
+The installer:
+
+- installs git and Python if they're missing
+- puts the code in `/opt/lurkme`, run by a locked-down `lurkme` system user
+- asks for your Twitch credentials and settings, and stores them in `/etc/lurkme/lurkme.env`, readable only by root and the bot. Generate the credentials on your own computer first (steps 1–2 above). Secret values stay hidden while you paste them.
+- starts the bot as a service that runs on boot and restarts itself after crashes
+
+To deploy a branch other than `main`, clone it with `git clone -b <branch> ...`.
+
+**Automated deploys** (no terminal, e.g. a script or an AI agent with SSH access): before running the installer, create
+`/etc/lurkme/lurkme.env` in the same format as `.env.example`. The installer then uses it without prompting and fixes its
+permissions. Alternatively, pass the values as environment variables:
+`sudo CLIENT_ID=… CLIENT_SECRET=… OAUTH_TOKEN=… REFRESH_TOKEN=… bash lurkme/deploy/install.sh`.
+Avoid that form on shared machines, because it puts the secrets in your shell history.
+
+| Task                          | Command |
+|-------------------------------|---------|
+| Watch the log                 | `journalctl -u lurkme -f` |
+| Check it's running            | `systemctl status lurkme` |
+| Update to the latest code     | `sudo bash /opt/lurkme/deploy/install.sh` |
+| Enter new tokens / settings   | `sudo bash /opt/lurkme/deploy/install.sh --reconfigure` |
+| Remove everything             | `sudo bash /opt/lurkme/deploy/install.sh --uninstall` |
+
+Run the bot in only one place at a time. Two copies logged in as the same account would double the join rate and could hit Twitch's limit.
+
 ## Keeping it running
 
 - Validates the token hourly and refreshes it before it expires.
 - Rejoins all channels after Twitch reconnects.
 - Pings Twitch when chat is quiet, and restarts itself if the connection stalls.
 - Retries Twitch outages and API errors with backoff (5s up to 5 min). It keeps its current channels in the meantime.
-- Exits only when the token is dead and can't be renewed. That happens if you changed your password, disconnected the app, or used a third-party token. Generate a new token (step 2) and update the variables.
+- Exits only when the token is dead and can't be renewed. That happens if you changed your password, disconnected the app, or used a third-party token. On a VPS the service then stays stopped instead of restarting in a loop (`systemctl status lurkme` shows `status=78/CONFIG`). Generate a new token (step 2) and run `sudo bash /opt/lurkme/deploy/install.sh --reconfigure`.
 
 ## Rate limits
 

@@ -14,7 +14,8 @@ Built to run unattended: it refreshes its token, rejoins after reconnects,
 retries Twitch outages, and restarts itself if the connection stalls. It only
 exits when the token is dead and can't be renewed.
 
-Configuration comes from environment variables (or a local .env file).
+Configuration comes from environment variables, a local .env file, or the file
+named by LURKME_ENV_FILE (the VPS installer uses /etc/lurkme/lurkme.env).
 See README.md for setup.
 """
 
@@ -31,9 +32,9 @@ import requests
 from dotenv import load_dotenv
 from twitchio.ext import commands
 
-# ── Config (env vars on Railway, or a local .env file — never hardcode secrets) ─
+# ── Config (env vars or a .env file — never hardcode secrets) ──────────────────
 
-load_dotenv()
+load_dotenv(os.getenv("LURKME_ENV_FILE"))  # None = look for a .env file as usual
 
 CLIENT_ID     = os.getenv("CLIENT_ID", "")
 CLIENT_SECRET = os.getenv("CLIENT_SECRET", "")
@@ -60,6 +61,7 @@ RESTART_DELAY_MIN = 5      # Backoff between restarts, doubling...
 RESTART_DELAY_MAX = 300    # ...up to this
 HEALTHY_RUN       = 600    # A run that lasted this long resets the backoff
 HTTP_TIMEOUT      = 10
+EXIT_CONFIG       = 78     # EX_CONFIG: credentials or settings need fixing — restarting won't help
 
 SCOPE_CHAT    = "chat:read"
 SCOPE_FOLLOWS = "user:read:follows"
@@ -71,9 +73,14 @@ HELIX_URL    = "https://api.twitch.tv/helix"
 TOKEN_URL    = "https://id.twitch.tv/oauth2/token"
 VALIDATE_URL = "https://id.twitch.tv/oauth2/validate"
 
-IS_TTY = sys.stdout.isatty()  # False on Railway — switches to plain log output
+IS_TTY = sys.stdout.isatty()  # False under systemd — switches to plain log output
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
+
+def die(msg: str):
+    """Exit with EXIT_CONFIG, which tells systemd (RestartPreventExitStatus) not to restart."""
+    print(msg, file=sys.stderr, flush=True)
+    raise SystemExit(EXIT_CONFIG)
 
 class AuthError(Exception):
     """Twitch rejected the credentials — retrying won't help until they're replaced."""
@@ -141,7 +148,7 @@ def check_token(info: dict, can_refresh: bool) -> bool:
     """Exit if the token can't join chat, warn about anything that limits the bot. Returns can_refresh."""
     scopes = info.get("scopes") or []
     if SCOPE_CHAT not in scopes:
-        raise SystemExit(f"[auth] OAUTH_TOKEN is missing the {SCOPE_CHAT} scope needed to join chat")
+        die(f"[auth] OAUTH_TOKEN is missing the {SCOPE_CHAT} scope needed to join chat")
     if SCOPE_FOLLOWS not in scopes:
         print(f"[auth] OAUTH_TOKEN lacks {SCOPE_FOLLOWS} — skipping followed channels", flush=True)
 
@@ -424,9 +431,9 @@ def run_bot(bot: LurkerBot):
     except asyncio.CancelledError:
         pass
     except KeyboardInterrupt:
-        bot.fatal = True
         with contextlib.suppress(Exception):
             loop.run_until_complete(bot.close())
+        raise
     except Exception as e:
         print(f"[main] Bot crashed: {e!r}", flush=True)
     finally:
@@ -438,7 +445,7 @@ def run_bot(bot: LurkerBot):
 
 def main():
     if not OAUTH_TOKEN:
-        raise SystemExit("OAUTH_TOKEN is not set — see README.md")
+        die("OAUTH_TOKEN is not set — see README.md")
 
     token         = OAUTH_TOKEN.removeprefix("oauth:")
     refresh_token = REFRESH_TOKEN
@@ -451,7 +458,7 @@ def main():
         try:
             token, refresh_token, info = get_valid_token(token, refresh_token, can_refresh)
         except AuthError as e:
-            raise SystemExit(f"[auth] {e} — see README.md")
+            die(f"[auth] {e} — see README.md")
         if not checked:
             check_config()
             can_refresh = check_token(info, can_refresh)
@@ -462,7 +469,7 @@ def main():
         started = time.monotonic()
         run_bot(bot)
         if bot.fatal:
-            raise SystemExit(1)
+            raise SystemExit(EXIT_CONFIG)
 
         # Carry state into the next run — the token may have been refreshed meanwhile
         token, refresh_token, gifted_subs = bot.user_token, bot.refresh_token, bot.gifted_subs
@@ -473,4 +480,5 @@ def main():
         delay = min(delay * 2, RESTART_DELAY_MAX)
 
 if __name__ == "__main__":
-    main()
+    with contextlib.suppress(KeyboardInterrupt):
+        main()
