@@ -32,6 +32,7 @@ from datetime import datetime, timezone
 import requests
 from dotenv import load_dotenv
 from twitchio.ext import commands
+from autojoin import AutoJoiner
 
 # ── Config (env vars or a .env file — never hardcode secrets) ──────────────────
 
@@ -54,7 +55,12 @@ CATEGORIES = _env_list("CATEGORIES")                                            
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 DISCORD_USER_ID     = os.getenv("DISCORD_USER_ID", "").strip()  # Numeric ID of the Discord user to @mention
 
-MAX_CHANNELS      = 80
+MAX_CHANNELS      = max(0, int(os.getenv("MAX_CHANNELS", "80")))  # 0 = no application cap
+BASE_CHANNELS     = 80
+AUTO_JOIN_MODE    = os.getenv("AUTO_JOIN_MODE", "off").lower()
+AUTO_JOIN_FILE    = os.getenv("AUTO_JOIN_FILE", "/var/lib/lurkme/auto_channels.sqlite3")
+if AUTO_JOIN_MODE not in ("off", "all"):
+    raise SystemExit("AUTO_JOIN_MODE must be off or all")
 JOIN_DELAY        = 0.6    # Twitch allows 20 JOINs per 10 seconds
 REFRESH_INTERVAL  = 1800   # Seconds between channel list refreshes
 VALIDATE_INTERVAL = 3600   # Twitch requires validating user tokens hourly
@@ -262,11 +268,14 @@ class LurkerBot(commands.Bot):
         self._alert_in_flight: dict | None = None
         for gift in pending_alerts or []:
             self.alerts.put_nowait(gift)
+        self.auto_join = (AutoJoiner(self, AUTO_JOIN_MODE, AUTO_JOIN_FILE,
+                                    max(0, MAX_CHANNELS - len(CHANNELS[:MAX_CHANNELS])) if MAX_CHANNELS else None, CHANNELS)
+                          if AUTO_JOIN_MODE != "off" else None)
 
     # ── Display ───────────────────────────────────────────────────────────────
 
     def _status(self):
-        line = f"  Channels: {len(self.joined)}/{MAX_CHANNELS}  |  Gifted subs: {self.gifted_subs}"
+        line = f"  Channels: {len(self.joined)}/{MAX_CHANNELS or 'unlimited'}  |  Gifted subs: {self.gifted_subs}"
         if IS_TTY:
             sys.stdout.write(f"\r{line:<80}")
             sys.stdout.flush()
@@ -290,6 +299,8 @@ class LurkerBot(commands.Bot):
         ]
         if DISCORD_WEBHOOK_URL:
             self._tasks.append(asyncio.create_task(self._send_alerts()))
+        if self.auto_join is not None:
+            self._tasks.append(asyncio.create_task(self.auto_join.run()))
         await super().start()
 
     async def _stop(self, reason: str, fatal: bool):
@@ -380,7 +391,7 @@ class LurkerBot(commands.Bot):
             data   = self._helix_get("streams/followed", params)
             logins += [s["user_login"] for s in data.get("data", [])]
             cursor = data.get("pagination", {}).get("cursor")
-            if not cursor or len(logins) >= MAX_CHANNELS:
+            if not cursor or len(logins) >= BASE_CHANNELS:
                 return logins
 
     def _get_category_ids(self) -> list[str]:
@@ -407,19 +418,26 @@ class LurkerBot(commands.Bot):
 
     def _build_target_list(self) -> list[str]:
         """Pinned channels first, then live followed channels, then top streams to fill."""
-        followed = self._get_live_followed_channels() if self.has_follows else []
-        mine     = list(dict.fromkeys(CHANNELS + followed))
-        top      = self._get_top_streamers() if len(mine) < MAX_CHANNELS else []
-
-        merged     = list(dict.fromkeys(mine + top))[:MAX_CHANNELS]
-        n_pinned   = min(len(CHANNELS), MAX_CHANNELS)
-        n_followed = min(len(mine), MAX_CHANNELS) - n_pinned
-        self._log(f"[sync] {n_pinned} pinned  |  {n_followed} followed live  |  "
-                  f"{len(merged) - n_pinned - n_followed} top streams to fill")
+        saved = list(self.auto_join.store.channels) if self.auto_join is not None else []
+        permanent = list(dict.fromkeys(CHANNELS + saved))
+        rotating = []
+        if not MAX_CHANNELS or len(permanent) < MAX_CHANNELS:
+            try:
+                followed = self._get_live_followed_channels() if self.has_follows else []
+                top = self._get_top_streamers() if len(followed) < BASE_CHANNELS else []
+                rotating = list(dict.fromkeys(followed + top))[:BASE_CHANNELS]
+            except Exception as exc:
+                self._log(f"[sync] API discovery unavailable; preserving permanent channels: {type(exc).__name__}")
+                rotating = sorted(self.joined)
+                self.loop.call_soon_threadsafe(self.loop.call_later, RETRY_DELAY, self._resync.set)
+        merged = list(dict.fromkeys(permanent + rotating))
+        if MAX_CHANNELS:
+            merged = merged[:MAX_CHANNELS]
+        self._log(f"[sync] {len(saved)} saved auto-joins  |  {len(merged)} total targets")
         return merged
 
     async def _join(self, channel: str) -> bool:
-        if channel in self.joined or len(self.joined) >= MAX_CHANNELS:
+        if channel in self.joined or (MAX_CHANNELS and len(self.joined) >= MAX_CHANNELS):
             return False
         try:
             await self.join_channels([channel])
@@ -472,12 +490,16 @@ class LurkerBot(commands.Bot):
     async def event_ready(self):
         self._log(f"[ready] Logged in as {self.nick}")
         await self._sync_channels(reset=True)
+        if self.auto_join is not None:
+            self.auto_join.ready.set()
 
     async def event_raw_data(self, data):
         self._last_data = time.monotonic()
         # Close frames arrive here as an int close code, hence the isinstance check
         if not isinstance(data, str):
             return
+        if self.auto_join is not None:
+            self.auto_join.observe(data)
         if "NOTICE * :Login authentication failed" in data or "NOTICE * :Login unsuccessful" in data:
             # twitchio would otherwise reconnect in a tight loop. A restart re-validates
             # (and refreshes) the token, and exits if it's really dead.
@@ -572,6 +594,8 @@ def run_bot(bot: LurkerBot):
         for task in pending:
             task.cancel()
         loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+        if bot.auto_join is not None:
+            bot.auto_join.store.close()
         loop.close()
 
 def send_test_alert():

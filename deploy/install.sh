@@ -207,6 +207,12 @@ EOF
     ask STREAM_LANGUAGES "Stream languages, comma-separated"         optional '[A-Za-z, ]*'      "${langs:-en}"
     ask CATEGORIES       "Categories, comma-separated (blank = all)" optional '[^"\\$`]*'      "$(current CATEGORIES)"
 
+    local auto_mode max_channels
+    auto_mode=$(current AUTO_JOIN_MODE)
+    max_channels=$(current MAX_CHANNELS)
+    ask AUTO_JOIN_MODE "Join chatters' channels: off or all" optional '(off|all)' "${auto_mode:-off}"
+    ask MAX_CHANNELS "Maximum channels (0 = no application cap)" optional '[0-9]+' "${max_channels:-80}"
+
     say "Discord gift alerts (optional)"
     cat <<'EOF'
   Paste a channel webhook URL (Server Settings > Integrations > Webhooks) to get a
@@ -227,7 +233,7 @@ write_env_file() {
     {
         echo "# lurkme settings, written by deploy/install.sh. Edit, then: sudo systemctl restart $APP"
         for var in CLIENT_ID CLIENT_SECRET OAUTH_TOKEN REFRESH_TOKEN CHANNELS STREAM_LANGUAGES CATEGORIES \
-                   DISCORD_WEBHOOK_URL DISCORD_USER_ID; do
+                   DISCORD_WEBHOOK_URL DISCORD_USER_ID AUTO_JOIN_MODE MAX_CHANNELS; do
             printf '%s="%s"\n' "$var" "${!var:-}"
         done
     } >"$tmp"
@@ -265,6 +271,8 @@ RestartPreventExitStatus=$EXIT_CONFIG
 # Lock the bot down: it only needs to read its code and settings and talk to Twitch
 NoNewPrivileges=yes
 ProtectSystem=strict
+StateDirectory=lurkme
+StateDirectoryMode=0700
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes

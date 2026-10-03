@@ -58,6 +58,12 @@ Set these the same way as the variables above. Each takes a comma-separated list
 
 Channels are picked in this order: `CHANNELS`, then your live followed channels, then top streams, up to 80 in total.
 
+### Persistent joins from chat activity
+
+Set `AUTO_JOIN_MODE=all` to save the channel of every person who sends a message in a channel the bot is watching, including offline channels. Saved channels stay in the target list through refreshes, reconnects and service restarts. The private SQLite registry lives at `/var/lib/lurkme/auto_channels.sqlite3`; keep this file when updating the bot.
+
+Set `MAX_CHANNELS=0` to remove the application's connection cap. A positive number keeps saved channels ahead of rotating channels and limits the target list to that number. The default is 80 with auto-joining off. The bot continues to pace JOIN requests, and Twitch may reject individual joins. Saved targets and confirmed connections are different counts.
+
 ### Discord gift alerts
 
 | Variable              | What it does |
