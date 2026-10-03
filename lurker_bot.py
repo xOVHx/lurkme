@@ -54,7 +54,7 @@ CATEGORIES = _env_list("CATEGORIES")                                            
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 DISCORD_USER_ID     = os.getenv("DISCORD_USER_ID", "").strip()  # Numeric ID of the Discord user to @mention
 
-MAX_CHANNELS      = 80
+MAX_CHANNELS      = 80     # Twitch allows 100 joined chats per account (since May 2024)
 JOIN_DELAY        = 0.6    # Twitch allows 20 JOINs per 10 seconds
 REFRESH_INTERVAL  = 1800   # Seconds between channel list refreshes
 VALIDATE_INTERVAL = 3600   # Twitch requires validating user tokens hourly

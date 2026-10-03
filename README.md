@@ -112,6 +112,8 @@ Run the bot in only one place at a time. Two copies logged in as the same accoun
 
 ## Rate limits
 
+Twitch allows an account to be in at most 100 chats at once (channels it moderates don't count).
+The bot stays in at most 80, which leaves room for chats you open yourself on the same account.
 JOINs are paced at about 17 per 10 seconds, under Twitch's limit of 20.
 The bot never sends chat messages.
 It makes a few API calls every 30 minutes, far below Twitch's API limits.
