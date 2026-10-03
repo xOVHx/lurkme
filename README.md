@@ -45,3 +45,17 @@ It does **not** earn official Channel Points or watch time, because those need t
    ```
 
 Never commit real credentials. `.env` is gitignored.
+
+## Keeping it running
+
+- Validates the token hourly and refreshes it before it expires.
+- Rejoins all channels after Twitch reconnects.
+- Pings Twitch when chat is quiet, and restarts itself if the connection stalls.
+- Retries Twitch outages and API errors with backoff (5s up to 5 min). It keeps its current channels in the meantime.
+- Exits only when the token is dead and can't be renewed. That happens if you changed your password, disconnected the app, or used a third-party token. Generate a new token (step 2) and update the variables.
+
+## Rate limits
+
+JOINs are paced at about 17 per 10 seconds, under Twitch's limit of 20.
+The bot never sends chat messages.
+It makes a few API calls every 30 minutes, far below Twitch's API limits.
