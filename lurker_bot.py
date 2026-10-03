@@ -124,7 +124,7 @@ def get_valid_token(token: str, refresh_token: str, can_refresh: bool) -> tuple[
             print("[auth] Token has expired, refreshing...", flush=True)
             token, refresh_token = refresh_oauth_token(CLIENT_ID, CLIENT_SECRET, refresh_token)
             refreshed = True
-        except requests.RequestException as e:
+        except OSError as e:  # Includes every requests error, plus TLS/CA-bundle problems
             print(f"[auth] Can't reach Twitch, retrying in {delay}s: {e}", flush=True)
             time.sleep(delay)
             delay = min(delay * 2, RESTART_DELAY_MAX)
@@ -363,9 +363,9 @@ class LurkerBot(commands.Bot):
                 self.joined.clear()
             try:
                 target = await asyncio.to_thread(self._build_target_list)
-            except requests.RequestException as e:
-                self._log(f"[sync] Twitch API error, retrying in {RETRY_DELAY}s: {e}")
-                if getattr(e.response, "status_code", None) == 401:
+            except Exception as e:  # Never leave the bot sitting in zero channels over one bad response
+                self._log(f"[sync] Twitch API error, retrying in {RETRY_DELAY}s: {type(e).__name__}: {e}")
+                if getattr(getattr(e, "response", None), "status_code", None) == 401:
                     self._check_token.set()  # Token died early — refresh it now
                 self.loop.call_later(RETRY_DELAY, self._resync.set)
                 return
