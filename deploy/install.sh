@@ -11,7 +11,7 @@
 # Re-run any time to update to the latest code:   sudo bash /opt/lurkme/deploy/install.sh
 #   --reconfigure   enter the credentials and settings again
 #   --test-discord  send a sample gift alert to the Discord webhook
-#   --uninstall     stop the service and remove the bot and its saved credentials
+#   --uninstall     stop the service and remove the bot, its saved credentials and gift stats
 #
 # Environment overrides: REPO_URL, BRANCH (which git branch to run).
 # For unattended installs, settings already in the environment (CLIENT_ID, CLIENT_SECRET,
@@ -37,6 +37,10 @@ warn() { printf '\033[1;33mWarning:\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31mError:\033[0m %s\n' "$*" >&2; exit 1; }
 
 has_systemd() { [[ -d /run/systemd/system ]]; }
+has_setting() { [[ -f $ENV_FILE ]] && grep -q "^$1=" "$ENV_FILE"; }
+
+OFF='[Oo][Ff][Ff]|[Nn][Oo]|[Ff][Aa][Ll][Ss][Ee]'  # Values the bot reads as "off"
+PORT_RANGE='102[4-9]|10[3-9][0-9]|1[1-9][0-9]{2}|[2-9][0-9]{3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5]'
 trim() { local s=$1; s=${s#"${s%%[![:space:]]*}"}; printf '%s' "${s%"${s##*[![:space:]]}"}"; }
 
 # ── Prerequisites ──────────────────────────────────────────────────────────────
@@ -136,7 +140,9 @@ setup_venv() {
     fi
     say "Installing Python packages"
     "$VENV_DIR/bin/python" -m pip install --quiet --disable-pip-version-check --upgrade pip
-    "$VENV_DIR/bin/python" -m pip install --quiet --disable-pip-version-check -r "$INSTALL_DIR/requirements.txt"
+    # "eager" also upgrades unpinned dependencies (aiohttp serves the dashboard; certifi, urllib3) to get fixes
+    "$VENV_DIR/bin/python" -m pip install --quiet --disable-pip-version-check --upgrade --upgrade-strategy eager \
+        -r "$INSTALL_DIR/requirements.txt"
     chmod -R u=rwX,go=rX "$VENV_DIR"
 }
 
@@ -154,7 +160,9 @@ current() {
 ask() {
     local var=$1 prompt=$2 kind=$3 pattern=$4 default=${5:-} value=${!1:-} hint=
     if [[ -n $default ]]; then
-        if [[ $kind == *secret ]]; then hint=" [Enter keeps the current one]"; else hint=" [$default]"; fi
+        if [[ $kind == optional-secret ]]; then hint=" [Enter keeps the current one, - removes it]"
+        elif [[ $kind == secret ]]; then hint=" [Enter keeps the current one]"
+        else hint=" [$default]"; fi
     fi
     while :; do
         if [[ -z $value ]]; then
@@ -217,26 +225,32 @@ EOF
   message whenever someone gifts you a sub. To be pinged, add your numeric user ID:
   Settings > Advanced > Developer Mode on, then right-click your name > Copy User ID.
 EOF
+    # Patterns match what lurker_bot.py accepts, so nothing the installer saves is ignored later
     ask DISCORD_WEBHOOK_URL "Webhook URL (blank = no alerts)"        optional-secret \
-        'https://([a-z]+\.)?discord(app)?\.com/api/webhooks/[0-9]+/[A-Za-z0-9_-]+' "$(current DISCORD_WEBHOOK_URL)"
-    ask DISCORD_USER_ID     "Your Discord user ID (blank = no ping)" optional '[0-9]{15,21}' "$(current DISCORD_USER_ID)"
+        'https://((canary|ptb)\.)?discord(app)?\.com/api/webhooks/[0-9]+/[A-Za-z0-9_-]+' "$(current DISCORD_WEBHOOK_URL)"
+    ask DISCORD_USER_ID     "Your Discord user ID (blank = no ping)" optional '[0-9]{15,20}' "$(current DISCORD_USER_ID)"
     local digest tz
     digest=$(current DIGEST_TIME)
+    [[ -z $digest ]] && has_setting DIGEST_TIME && digest=off  # Blank in the file means off to the bot
     tz=$(current TIMEZONE)
-    ask DIGEST_TIME "Daily digest time, HH:MM or off"           optional '(([01]?[0-9]|2[0-3]):[0-5][0-9]|off)' "${digest:-21:00}"
-    ask TIMEZONE    "Your timezone, e.g. America/New_York"      optional '[A-Za-z]+(/[A-Za-z0-9_+-]+)*' "${tz:-$(system_tz)}"
+    ask DIGEST_TIME "Daily digest time, HH:MM or off"           optional "(([01]?[0-9]|2[0-3]):[0-5][0-9]|$OFF)" "${digest:-21:00}"
+    DIGEST_TIME=${DIGEST_TIME:-off}
+    ask TIMEZONE    "Your timezone, e.g. America/New_York"      optional '[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)*' "${tz:-$(system_tz)}"
 
     say "Web dashboard (optional)"
     cat <<'EOF'
   A live page with your channels, gifts and stats. Without a password it's only
   reachable through an SSH tunnel (safest). With a password it's open on the
-  server's public IP over plain HTTP.
+  server's public IP over plain HTTP (log in with any username). The password
+  can't contain spaces, quotes, $, \ or backticks.
 EOF
     local port
     port=$(current DASHBOARD_PORT)
-    ask DASHBOARD_PORT     "Dashboard port (0 = off)"                         optional '[0-9]{1,5}'               "${port:-8787}"
-    ask DASHBOARD_PASSWORD "Dashboard password, 8+ characters (blank = tunnel only)" optional-secret '[^"\\$`[:space:]]{8,}' \
-        "$(current DASHBOARD_PASSWORD)"
+    [[ -z $port ]] && has_setting DASHBOARD_PORT && port=0
+    ask DASHBOARD_PORT     "Dashboard port, 1024-65535 (0 = off)"    optional "(0|$OFF|$PORT_RANGE)" "${port:-8787}"
+    DASHBOARD_PORT=${DASHBOARD_PORT:-0}
+    ask DASHBOARD_PASSWORD "Dashboard password, 8+ characters (none = SSH tunnel only)" optional-secret \
+        '[^"\\$`[:space:]]{8,}' "$(current DASHBOARD_PASSWORD)"
     # shellcheck disable=SC2034  # Read via ${!var} in write_env_file
     if [[ -n $DASHBOARD_PASSWORD ]]; then DASHBOARD_HOST=0.0.0.0; else DASHBOARD_HOST=127.0.0.1; fi
 
@@ -286,6 +300,7 @@ User=$SERVICE_USER
 Group=$SERVICE_USER
 WorkingDirectory=$INSTALL_DIR
 Environment=LURKME_ENV_FILE=$ENV_FILE
+Environment=LURKME_DATA_DIR=$STATE_DIR
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONDONTWRITEBYTECODE=1
 ExecStart=$VENV_DIR/bin/python $INSTALL_DIR/lurker_bot.py
@@ -353,17 +368,23 @@ start_service() {
 }
 
 print_help() {
+    # Same defaults as the bot: port 8787 unless it's off; public only with a password
     local port host
     port=$(current DASHBOARD_PORT)
+    has_setting DASHBOARD_PORT || port=8787
+    [[ -z $port || $port =~ ^($OFF)$ ]] && port=0
     host=$(current DASHBOARD_HOST)
-    if [[ ${port:-0} != 0 ]]; then
+    [[ -z $host && -n $(current DASHBOARD_PASSWORD) ]] && host=0.0.0.0
+    if [[ $port != 0 ]]; then
         echo
-        if [[ $host == 0.0.0.0 ]]; then
-            say "Dashboard: http://<this server's IP>:$port (password protected; the SSH tunnel below is safer)"
+        if [[ $host != 127.0.0.1 && $host != localhost && -n $(current DASHBOARD_PASSWORD) ]]; then
+            say "Dashboard: http://<this server's IP>:$port (log in with any username and your dashboard password)."
+            echo "    Open port $port in your firewall if needed. The SSH tunnel below is safer (no plain HTTP):"
         else
-            say "Dashboard: from your computer run  ssh -L $port:localhost:$port <you>@<this server>"
-            echo "    then open http://localhost:$port in your browser."
+            say "Dashboard (reachable from this server only):"
         fi
+        echo "    From your computer run  ssh -L $port:localhost:$port <you>@<this server>"
+        echo "    then open http://localhost:$port in your browser."
     fi
     cat <<EOF
 
@@ -412,15 +433,25 @@ main() {
     esac
     [[ $EUID -eq 0 ]] || die "Run this with sudo: sudo bash $0"
 
+    # Lock down a hand-made settings file before any step that can fail (only "other" access is removed,
+    # so a running bot keeps reading it)
+    if [[ -d $ENV_DIR ]]; then chmod o-rwx "$ENV_DIR"; fi
+    if [[ -f $ENV_FILE ]]; then chmod o-rwx "$ENV_FILE"; fi
+
     detect_source
     install_packages
     ensure_user
+    # Bash runs the installer it read at start. When it's /opt/lurkme's own copy, the update below rewrites
+    # that very file, so remember what's running now and continue with the new version if it changed.
+    local running
+    running=$(cat "${BASH_SOURCE[0]}")
     fetch_code
-    # Bash already holds this (possibly older) installer in memory; continue with the one just downloaded
-    if [[ -z ${LURKME_REEXEC:-} ]] && ! cmp -s "${BASH_SOURCE[0]}" "$INSTALL_DIR/deploy/install.sh"; then
+    if [[ -z ${LURKME_REEXEC:-} && $running != "$(cat "$INSTALL_DIR/deploy/install.sh")" ]]; then
         say "The installer itself was updated, continuing with the new version"
         LURKME_REEXEC=1 exec bash "$INSTALL_DIR/deploy/install.sh" "$@"
     fi
+    # Stats live here; systemd's StateDirectory does this too, but older systemd and manual runs need it
+    install -d -m 700 -o "$SERVICE_USER" -g "$SERVICE_USER" "$STATE_DIR"
     setup_venv
 
     if $reconfigure || [[ ! -f $ENV_FILE ]]; then
@@ -437,7 +468,7 @@ main() {
     write_unit
     if ! has_systemd; then
         warn "systemd isn't running here, so the service wasn't started. Run the bot by hand with:"
-        echo "  sudo -u $SERVICE_USER LURKME_ENV_FILE=$ENV_FILE $VENV_DIR/bin/python $INSTALL_DIR/lurker_bot.py" >&2
+        echo "  sudo -u $SERVICE_USER LURKME_ENV_FILE=$ENV_FILE LURKME_DATA_DIR=$STATE_DIR $VENV_DIR/bin/python $INSTALL_DIR/lurker_bot.py" >&2
         exit 2
     fi
     start_service

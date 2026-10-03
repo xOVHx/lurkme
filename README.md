@@ -12,7 +12,7 @@ The channel list is refreshed every 30 minutes, and channels that drop out are l
   recent gifts, drop stats, and bot health.
 - Stats are kept in a small database, so they survive restarts and updates.
 
-Being in chat earns third-party bot points (StreamElements, Nightbot, etc.).
+Being in chat earns third-party loyalty points (StreamElements, Streamlabs, etc.).
 It does **not** earn official Channel Points or watch time, because those need the video player open.
 
 ## Setup
@@ -45,7 +45,7 @@ It does **not** earn official Channel Points or watch time, because those need t
    | `OAUTH_TOKEN`   | User Access Token from step 2         |
    | `REFRESH_TOKEN` | Refresh Token from step 2             |
 
-4. **Run it:**
+4. **Run it** (Python 3.10–3.14):
 
    ```sh
    pip install -r requirements.txt
@@ -74,17 +74,17 @@ Channels are picked in this order: `CHANNELS`, then your live followed channels,
 | `DISCORD_WEBHOOK_URL` | Posts a card to this Discord webhook whenever someone gifts you a sub: the channel and its avatar, who gifted it, the tier and the length. Create one under Server Settings → Integrations → Webhooks. Keep it private, because anyone with the URL can post to that channel. |
 | `DISCORD_USER_ID`     | Pings you in each alert. This must be your numeric user ID, because a webhook can't ping by username. To find it, turn on Settings → Advanced → Developer Mode, then right-click your name → Copy User ID. |
 | `DIGEST_TIME`         | When to post the daily digest: gifts won, drops seen, your odds, top channels for gift drops, and lurk time. Default `21:00`; `off` disables it. |
-| `TIMEZONE`            | Timezone for `DIGEST_TIME`, e.g. `America/New_York`. Default: the server's. |
+| `TIMEZONE`            | Timezone for `DIGEST_TIME`, e.g. `America/New_York`. Default: the server's. (Running it on Windows yourself? Also `pip install tzdata`.) |
 
 With a webhook set, the bot also posts a green "online" card when it comes back after more than 10 minutes of downtime. If it ever stops because its credentials died, it posts a red card that pings you, with the exact command to fix it.
-Alerts are sent in the background and retried if Discord is down or rate-limited. If the bot restarts, unsent alerts carry over to the next run.
+Alerts are sent in the background. If Discord is down or rate-limited, they're retried for up to a day, and unsent alerts are saved so they survive restarts and updates.
 
 ### Dashboard
 
 | Variable             | Default     | What it does |
 |----------------------|-------------|--------------|
 | `DASHBOARD_PORT`     | `8787`      | Port for the live dashboard. `0` or `off` disables it. |
-| `DASHBOARD_PASSWORD` | none        | Without one, the dashboard only listens on the server itself. Open it through an SSH tunnel: `ssh -L 8787:localhost:8787 you@your-server`, then browse to <http://localhost:8787>. With a password, it also listens on the server's public IP, behind a browser login prompt. That traffic is plain HTTP, so the tunnel is safer. |
+| `DASHBOARD_PASSWORD` | none        | Without one, the dashboard only listens on the server itself. Open it through an SSH tunnel: `ssh -L 8787:localhost:8787 you@your-server`, then browse to <http://localhost:8787>. With a password (8+ characters, no spaces, quotes, `$`, `\` or backticks), it also listens on the server's public IP, behind a browser login prompt. The username can be anything. Open the port in your firewall if you have one. That traffic is plain HTTP, so the tunnel is safer. |
 | `DASHBOARD_HOST`     | `127.0.0.1` | Where to listen. Anything other than localhost requires `DASHBOARD_PASSWORD`. The installer sets this for you. |
 
 Stats are stored in `/var/lib/lurkme/lurkme.db` on a VPS (or `data/` next to the script when run locally).
@@ -108,10 +108,18 @@ The installer:
 To deploy a branch other than `main`, clone it with `git clone -b <branch> ...`.
 
 **Automated deploys** (no terminal, e.g. a script or an AI agent with SSH access): before running the installer, create
-`/etc/lurkme/lurkme.env` in the same format as `.env.example`. The installer then uses it without prompting and fixes its
-permissions. Alternatively, pass the values as environment variables:
-`sudo CLIENT_ID=… CLIENT_SECRET=… OAUTH_TOKEN=… REFRESH_TOKEN=… bash lurkme/deploy/install.sh`.
-Avoid that form on shared machines, because it puts the secrets in your shell history.
+the settings file privately and fill it in, in the same format as `.env.example`:
+
+```sh
+sudo install -d -m 700 /etc/lurkme && sudo install -m 600 /dev/null /etc/lurkme/lurkme.env
+sudo nano /etc/lurkme/lurkme.env   # or write it with your tool of choice
+```
+
+The installer then uses it without prompting and sets its final permissions. Don't pass secrets on the command line
+(`sudo CLIENT_ID=… bash …`): other users on the server can see them in the process list, and they end up in your shell history.
+
+**Updating from a version before the dashboard:** run the update command twice. The first run still uses the old installer,
+which doesn't know about the new stats directory. The second run finishes the setup. Newer installers update themselves.
 
 | Task                          | Command |
 |-------------------------------|---------|
@@ -138,4 +146,4 @@ Twitch allows an account to be in at most 100 chats at once (channels it moderat
 By default the bot uses all 100. If you also chat on the same account, set `MAX_CHANNELS` lower so the total stays under 100.
 JOINs are paced at about 17 per 10 seconds, under Twitch's limit of 20.
 The bot never sends chat messages.
-It makes a few API calls every 30 minutes, far below Twitch's API limits.
+It makes a few API calls every 30 minutes, plus one every 5 minutes for the dashboard's viewer counts. That's far below Twitch's API limits.

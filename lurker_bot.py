@@ -11,7 +11,7 @@ heads-up if the bot ever needs you) and a live web dashboard.
 
 Note: Official Twitch Channel Points and Watch Hours require
 the video player to be open — chat presence alone does not count.
-Third-party bot points (StreamElements, Nightbot, etc.) DO work
+Third-party loyalty points (StreamElements, Streamlabs, etc.) DO work
 just from being in chat.
 
 Built to run unattended: it refreshes its token, rejoins after reconnects,
@@ -27,10 +27,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
+import logging
 import os
 import re
 import sys
 import time
+import traceback
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -81,8 +84,8 @@ TIMEZONE            = os.getenv("TIMEZONE", "").strip()          # IANA name for
 
 # Optional web dashboard. Without a password it only listens on this machine (use an SSH tunnel).
 DASHBOARD_PORT     = _env_int("DASHBOARD_PORT", 8787)  # 0 / "off" disables it
-DASHBOARD_HOST     = os.getenv("DASHBOARD_HOST", "127.0.0.1").strip()
 DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "")
+DASHBOARD_HOST     = os.getenv("DASHBOARD_HOST", "").strip() or ("0.0.0.0" if DASHBOARD_PASSWORD else "127.0.0.1")
 
 # Stats database: systemd's StateDirectory, or ./data next to this script
 DATA_DIR = (os.getenv("LURKME_DATA_DIR") or os.getenv("STATE_DIRECTORY", "").split(":")[0]
@@ -101,6 +104,7 @@ RESTART_DELAY_MIN = 5      # Backoff between restarts, doubling...
 RESTART_DELAY_MAX = 300    # ...up to this
 HEALTHY_RUN       = 600    # A run that lasted this long resets the backoff
 ONLINE_AFTER_DOWN = 600    # Send the "online" card only after this much downtime (no spam on quick restarts)
+ALERT_MAX_AGE     = 86400  # Keep retrying an undelivered Discord alert for up to a day
 HTTP_TIMEOUT      = 10
 EXIT_CONFIG       = 78     # EX_CONFIG: credentials or settings need fixing — restarting won't help
 
@@ -113,11 +117,51 @@ WEBHOOK_RE  = re.compile(r"https://(?:(?:canary|ptb)\.)?discord(?:app)?\.com/api
 USER_ID_RE  = re.compile(r"[0-9]{15,20}")  # ASCII digits only; Discord IDs are 64-bit
 TIME_RE     = re.compile(r"([01]?[0-9]|2[0-3]):([0-5][0-9])")
 
+LOGIN_FAILED = (":tmi.twitch.tv NOTICE * :Login authentication failed", ":tmi.twitch.tv NOTICE * :Login unsuccessful")
+
 HELIX_URL    = "https://api.twitch.tv/helix"
 TOKEN_URL    = "https://id.twitch.tv/oauth2/token"
 VALIDATE_URL = "https://id.twitch.tv/oauth2/validate"
 
 IS_TTY = sys.stdout.isatty()  # False under systemd — switches to plain log output
+
+# ── Logging: never print a secret ─────────────────────────────────────────────
+
+SECRETS: set[str] = set()  # Every credential seen so far, refreshed tokens included
+
+def remember_secrets(*values: str | None):
+    SECRETS.update(v for v in values if v and len(v) >= 6)
+
+def redact(text: str) -> str:
+    for secret in SECRETS:
+        text = text.replace(secret, "***")
+    return text
+
+class _RedactSecrets(logging.Filter):
+    """Scrub known secrets from library log lines and their tracebacks before they reach the journal."""
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+        except Exception:
+            msg = str(record.msg)
+        if record.exc_info:
+            msg += "\n" + "".join(traceback.format_exception(*record.exc_info))
+            record.exc_info = record.exc_text = None
+        record.msg, record.args = redact(msg), None
+        return True
+
+def setup_logging():
+    handler = logging.StreamHandler(sys.stderr)
+    handler.addFilter(_RedactSecrets())
+    handler.setFormatter(logging.Formatter("[%(name)s] %(message)s"))
+    logging.basicConfig(level=logging.WARNING, handlers=[handler], force=True)
+    # twitchio logs the raw token when Twitch rejects a login; the bot logs its own token-free line instead
+    logging.getLogger("twitchio.websocket").addFilter(
+        lambda record: not str(record.msg).startswith("Login unsuccessful with token"))
+    # ...and then trips over its own cancelled task while closing. Harmless, but it prints a scary traceback.
+    logging.getLogger("asyncio").addFilter(lambda record: not (
+        "WSConnection._task_callback" in str(record.msg)
+        and record.exc_info and record.exc_info[0] is asyncio.CancelledError))
 
 DIGEST_AT: tuple[int, int] | None = None  # Parsed DIGEST_TIME, set by check_config()
 TZ: ZoneInfo | None = None                # Parsed TIMEZONE (None = server's local time)
@@ -208,7 +252,7 @@ def get_valid_token(token: str, refresh_token: str, can_refresh: bool) -> tuple[
 def check_config():
     """Validate the optional settings (dropping bad ones with a warning), then log the setup."""
     global CHANNELS, LANGUAGES, MAX_CHANNELS, DISCORD_WEBHOOK_URL, DISCORD_USER_ID
-    global DIGEST_AT, TZ, DASHBOARD_PORT, DASHBOARD_HOST
+    global DIGEST_AT, TZ, TIMEZONE, DASHBOARD_PORT, DASHBOARD_HOST
     for name, values, pattern in (("CHANNELS", CHANNELS, LOGIN_RE), ("STREAM_LANGUAGES", LANGUAGES, LANGUAGE_RE)):
         bad = [v for v in values if not pattern.fullmatch(v)]
         if bad:
@@ -239,6 +283,7 @@ def check_config():
             TZ = ZoneInfo(TIMEZONE)
         except (ZoneInfoNotFoundError, ValueError):
             print(f"[config] Unknown TIMEZONE {TIMEZONE!r} — using the server's time", flush=True)
+            TIMEZONE = ""  # So logs and the digest card say "server time" too
 
     if not 0 <= DASHBOARD_PORT <= 65535:
         print("[config] DASHBOARD_PORT must be 0–65535 — dashboard disabled", flush=True)
@@ -298,6 +343,9 @@ class Session:
     gifted_subs:   int = 0
     alerts:        list = field(default_factory=list)  # Discord messages not yet delivered
     announced:     bool = False
+    down_since:    float | None = None   # When the last run ended, for the "back online" card after restarts
+    last_digest:   str | None = None     # Also kept in memory so a failed DB write can't repeat the digest
+    last_target:   list = field(default_factory=list)  # Last good channel list, used while Helix is down
 
 class LurkerBot(commands.Bot):
 
@@ -372,12 +420,13 @@ class LurkerBot(commands.Bot):
         board = None
         if DASHBOARD_PORT:
             try:
-                app   = dashboard.create_app(self.status_snapshot, DASHBOARD_PASSWORD or None)
+                app   = dashboard.create_app(self.status_snapshot, DASHBOARD_PASSWORD or None, get_health=self.is_connected)
                 board = await dashboard.start_dashboard(app, DASHBOARD_HOST, DASHBOARD_PORT)
                 if not self.session.restarts:
                     self._log(f"[dashboard] Listening on http://{DASHBOARD_HOST}:{DASHBOARD_PORT}")
-            except OSError as e:
-                self._log(f"[dashboard] Couldn't listen on {DASHBOARD_HOST}:{DASHBOARD_PORT} ({e.strerror or e})")
+            except Exception as e:  # A bad port or host name must never keep the bot out of chat
+                problem = getattr(e, "strerror", None) or e
+                self._log(f"[dashboard] Couldn't listen on {DASHBOARD_HOST}:{DASHBOARD_PORT} ({problem})")
         try:
             await super().start()
         finally:
@@ -422,19 +471,22 @@ class LurkerBot(commands.Bot):
             elapsed   = min(now - last_tick, 2 * STATS_INTERVAL)
             last_tick = now
             try:
-                if self.joined:
-                    self.store.add_presence({ch: elapsed for ch in self.joined}, time.time())
-                self.store.set_meta("last_seen", str(time.time()))
-                if now >= next_info:
+                # Database work runs in a thread: a locked or slow disk must not stall the chat connection
+                lurked = {ch: elapsed for ch in self.joined}
+                await asyncio.to_thread(self._record_tick, lurked)
+                if DASHBOARD_PORT and now >= next_info:  # Viewer counts only matter for the dashboard
                     next_info = now + INFO_INTERVAL
                     await self._refresh_channel_info()
-                self._maybe_queue_digest()
+                card = await asyncio.to_thread(self._digest_card)
+                if card:
+                    self._queue_card("digest", card)
             except Exception as e:
                 self._log(f"[stats] Housekeeping failed: {type(e).__name__}: {e}")
 
     # ── Token upkeep ──────────────────────────────────────────────────────────
 
     def _set_user_token(self, token: str):
+        remember_secrets(token, self.refresh_token)
         self.user_token = token
         # twitchio 2.x reads these on every IRC (re)connect and Helix call
         self._connection._token = token
@@ -499,16 +551,18 @@ class LurkerBot(commands.Bot):
         return found
 
     def _get_live_followed_channels(self) -> list[dict]:
-        streams, cursor = [], None
-        while True:
+        streams, cursor, seen = [], None, set()
+        for _ in range(20):  # A cursor that never advances must not spin forever
             params = {"user_id": self.account_id, "first": 100}
             if cursor:
                 params["after"] = cursor
             data    = self._helix_get("streams/followed", params)
             streams += data.get("data", [])
             cursor  = data.get("pagination", {}).get("cursor")
-            if not cursor or len(streams) >= MAX_CHANNELS:
-                return streams
+            if not cursor or cursor in seen or len(streams) >= MAX_CHANNELS:
+                break
+            seen.add(cursor)
+        return streams
 
     def _get_category_ids(self) -> list[str]:
         if self._category_ids is None:  # Resolve CATEGORIES names once per run
@@ -539,6 +593,9 @@ class LurkerBot(commands.Bot):
         info     = {s["user_login"]: _stream_info(s, "followed") for s in followed}
         mine     = list(dict.fromkeys(pinned + list(info)))
         top      = self._get_top_streamers() if len(mine) < MAX_CHANNELS else []
+        if not top and len(mine) < MAX_CHANNELS and len(self.joined) > len(mine):
+            # We're in top-stream channels now; an empty list is a Helix glitch, not a reason to leave them all
+            raise RuntimeError("Twitch returned no live streams")
         for s in top:
             info.setdefault(s["user_login"], _stream_info(s, "top"))
         merged = list(dict.fromkeys(mine + [s["user_login"] for s in top]))[:MAX_CHANNELS]
@@ -599,13 +656,19 @@ class LurkerBot(commands.Bot):
                 self.joined.clear()
             try:
                 target, info = await asyncio.to_thread(self._build_target_list)
+                self.session.last_target, self.channel_info = target, info
             except Exception as e:  # Never leave the bot sitting in zero channels over one bad response
                 self._log(f"[sync] Twitch API error, retrying in {RETRY_DELAY}s: {type(e).__name__}: {e}")
                 if getattr(getattr(e, "response", None), "status_code", None) == 401:
                     self._check_token.set()  # Token died early — refresh it now
                 self.loop.call_later(RETRY_DELAY, self._resync.set)
-                return
-            self.channel_info = info
+                if self.joined:
+                    return  # Keep the channels we're in until Helix answers again
+                # A fresh connection during the outage: rejoin the last good list, or at least the pinned channels
+                target = self.session.last_target or CHANNELS[:MAX_CHANNELS]
+                if not target:
+                    return
+                self._log(f"[sync] Rejoining {len(target)} channels from the last good list meanwhile")
 
             stale = [ch for ch in self.joined if ch not in target]
             if stale:
@@ -632,8 +695,19 @@ class LurkerBot(commands.Bot):
 
     # ── Dashboard ─────────────────────────────────────────────────────────────
 
+    def is_connected(self) -> bool:
+        return self._connection.is_alive and time.monotonic() - self._last_data < STALL_TIMEOUT
+
     def status_snapshot(self) -> dict:
-        """Everything the dashboard shows. No secrets: no tokens, no webhook URL."""
+        """Everything the dashboard shows (cached for a couple of seconds). No secrets: no tokens, no webhook URL."""
+        cached = getattr(self, "_snapshot", None)
+        if cached and time.monotonic() - cached[0] < 2:
+            return cached[1]
+        snapshot = self._build_snapshot()
+        self._snapshot = (time.monotonic(), snapshot)
+        return snapshot
+
+    def _build_snapshot(self) -> dict:
         now   = time.time()
         today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
         lurk  = self.store.lurk_today(now)
@@ -659,7 +733,7 @@ class LurkerBot(commands.Bot):
             "bot": {
                 "nick":               self.nick,
                 "started_at":         self.session.started_at,
-                "connected":          self._connection.is_alive and idle < STALL_TIMEOUT,
+                "connected":          self.is_connected(),
                 "last_data_age":      idle,
                 "token_expires_in":   self.token_expires - now if self.token_expires else None,
                 "token_auto_refresh": self.can_refresh,
@@ -668,6 +742,7 @@ class LurkerBot(commands.Bot):
                 "categories":         CATEGORIES,
                 "discord":            bool(DISCORD_WEBHOOK_URL),
                 "restarts":           self.session.restarts,
+                "stats_saved":        self.store.persistent,
             },
             "channels":     channels,
             "stats":        {"today": self.store.summary(since=today), "all_time": self.store.summary()},
@@ -682,14 +757,22 @@ class LurkerBot(commands.Bot):
         self.session.announced = True
         await self._sync_channels(reset=True)
         if first:
-            self._announce_online()
+            self._announce_online(self.session.previous_seen)  # Since the previous process was last alive
+        elif self.session.down_since:
+            self._announce_online(self.session.down_since)     # After an in-process restart
+        self.session.down_since = None
+
+    async def event_error(self, error: Exception, data: str | None = None):
+        text = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+        self._log(redact(f"[error] {text.rstrip()}"))
 
     async def event_raw_data(self, data):
         self._last_data = time.monotonic()
         # Close frames arrive here as an int close code, hence the isinstance check
         if not isinstance(data, str):
             return
-        if "NOTICE * :Login authentication failed" in data or "NOTICE * :Login unsuccessful" in data:
+        # Match whole server lines only: chat messages can contain the same words
+        if any(line.startswith(LOGIN_FAILED) for line in data.split("\r\n")):
             # twitchio would otherwise reconnect in a tight loop. A restart re-validates
             # (and refreshes) the token, and exits if it's really dead.
             await asyncio.sleep(0)  # Let twitchio finish handling this line before we disconnect
@@ -723,7 +806,7 @@ class LurkerBot(commands.Bot):
                   f"(this run: {self.gifted_subs}, all-time: {lifetime if lifetime is not None else '?'})")
 
         if DISCORD_WEBHOOK_URL:
-            self.alerts.put_nowait({"kind": "gift", "lifetime": lifetime, "gift": {
+            self._enqueue({"kind": "gift", "lifetime": lifetime, "gift": {
                 "channel": channel.name,
                 "room_id": tags.get("room-id", ""),
                 "gifter":  gifter,
@@ -735,36 +818,52 @@ class LurkerBot(commands.Bot):
 
     # ── Discord ───────────────────────────────────────────────────────────────
 
-    def _queue_card(self, label: str, payload: dict):
+    def _enqueue(self, item: dict):
         if DISCORD_WEBHOOK_URL:
-            self.alerts.put_nowait({"kind": "card", "label": label, "payload": payload})
+            self.alerts.put_nowait({**item, "queued_at": time.time()})
+            self._save_outbox()
 
-    def _announce_online(self):
-        """A green card when the bot comes back after real downtime (or its very first start)."""
-        prev = self.session.previous_seen
-        down = time.time() - prev if prev else None
+    def _queue_card(self, label: str, payload: dict):
+        self._enqueue({"kind": "card", "label": label, "payload": payload})
+
+    def _save_outbox(self):
+        """Keep undelivered alerts in the stats DB so they survive service restarts and updates too."""
+        pending = ([self._alert_in_flight] if self._alert_in_flight else []) + list(self.alerts._queue)
+        self.store.set_meta("outbox", json.dumps(pending))
+
+    def _record_tick(self, lurked: dict[str, float]):
+        if lurked:
+            self.store.add_presence(lurked, time.time())
+        self.store.set_meta("last_seen", str(time.time()))
+
+    def _announce_online(self, since: float | None):
+        """A green card when the bot comes back after real downtime (or on its very first start)."""
+        down = time.time() - since if since else None
         if down is not None and down < ONLINE_AFTER_DOWN:
             return
         hint = f"http://localhost:{DASHBOARD_PORT} (via SSH tunnel)" if DASHBOARD_PORT and not DASHBOARD_PASSWORD \
             else (f"port {DASHBOARD_PORT}" if DASHBOARD_PORT else None)
         self._queue_card("online", cards.online_card(self.nick or "?", len(self.joined), MAX_CHANNELS, down, hint))
 
-    def _maybe_queue_digest(self):
-        """Once a day at DIGEST_TIME: a summary card of the last 24 hours."""
+    def _digest_card(self) -> dict | None:
+        """Once a day at DIGEST_TIME: a summary card of the last 24 hours. Runs in a worker thread."""
         if not (DIGEST_AT and DISCORD_WEBHOOK_URL):
-            return
-        local = datetime.now(TZ) if TZ else datetime.now().astimezone()
-        today = local.date().isoformat()
-        due   = (local.hour, local.minute) >= DIGEST_AT
-        last  = self.store.get_meta("last_digest")
-        if last is not None and (not due or last == today):
-            return
+            return None
+        local  = datetime.now(TZ) if TZ else datetime.now().astimezone()
+        today  = local.date().isoformat()
+        due    = (local.hour, local.minute) >= DIGEST_AT
+        # The in-memory copy stops a repeat every minute if the DB can't be written; >= copes with the clock going back
+        last = max(filter(None, (self.store.get_meta("last_digest"), self.session.last_digest)), default=None)
+        if last is not None and (not due or last >= today):
+            return None
         all_time = self.store.summary()
         lurked   = all_time["lurk_seconds"]
         if last is None:  # First run ever: today's digest is still to come only if its time hasn't passed
-            self.store.set_meta("last_digest", today if due else (local.date() - timedelta(days=1)).isoformat())
+            self.session.last_digest = today if due else (local.date() - timedelta(days=1)).isoformat()
+            self.store.set_meta("last_digest", self.session.last_digest)
             self.store.set_meta("digest_lurk_total", str(lurked))
-            return
+            return None
+        self.session.last_digest = today
         self.store.set_meta("last_digest", today)
 
         # Lurk time is stored per UTC day, so "since 24h ago" would count up to two whole days.
@@ -775,9 +874,8 @@ class LurkerBot(commands.Bot):
         except ValueError:
             pass
         self.store.set_meta("digest_lurk_total", str(lurked))
-        card = cards.digest_card(self.nick or "?", period, all_time, len(self.joined), MAX_CHANNELS,
+        return cards.digest_card(self.nick or "?", period, all_time, len(self.joined), MAX_CHANNELS,
                                  time.time() - self.session.started_at, TIMEZONE or "server time")
-        self._queue_card("digest", card)
 
     def pending_alerts(self) -> list[dict]:
         """Messages not yet delivered, including one cut off mid-send — handed to the next run on restart."""
@@ -813,8 +911,13 @@ class LurkerBot(commands.Bot):
             except Exception as e:  # One bad item must not stop every later alert
                 self._log(f"[discord] Skipped an alert that couldn't be built: {type(e).__name__}: {e}")
                 self._alert_in_flight = None
+                self._save_outbox()
                 continue
-            for attempt in range(1, 6):
+            # Keep retrying through a Discord outage (backoff up to 10 min), but not forever
+            give_up = (item.get("queued_at") or time.time()) + ALERT_MAX_AGE
+            attempt = 0
+            while True:
+                attempt += 1
                 try:
                     await asyncio.to_thread(send_discord, payload)
                     self._log(f"[discord] Sent the {label}")
@@ -827,12 +930,15 @@ class LurkerBot(commands.Bot):
                     problem = f"HTTP {status}"
                 except Exception as e:
                     problem = type(e).__name__  # Not str(e): requests errors include the webhook URL
-                delay = min(RETRY_DELAY, 5 * 2 ** attempt)
-                self._log(f"[discord] Couldn't send the {label} ({problem}), retry {attempt}/5 in {delay}s")
+                if time.time() >= give_up:
+                    self._log(f"[discord] Gave up on the {label} after {attempt} tries")
+                    break
+                delay = min(600, 5 * 2 ** min(attempt, 7))
+                if attempt <= 3 or attempt % 10 == 0:
+                    self._log(f"[discord] Couldn't send the {label} ({problem}), retrying in {delay}s")
                 await asyncio.sleep(delay)
-            else:
-                self._log(f"[discord] Gave up on the {label}")
             self._alert_in_flight = None
+            self._save_outbox()
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
@@ -870,7 +976,18 @@ def send_test_alert():
         die(f"[discord] Couldn't reach Discord ({type(e).__name__})", alert=False)  # Not str(e): it includes the URL
     print("[discord] Test alert sent — check your Discord", flush=True)
 
+def _load_outbox(store: StatsStore) -> list[dict]:
+    """Discord alerts a previous process couldn't deliver."""
+    try:
+        items = json.loads(store.get_meta("outbox") or "[]")
+        return [item for item in items if isinstance(item, dict) and item.get("kind") in ("gift", "card")]
+    except (ValueError, TypeError):
+        return []
+
 def main():
+    setup_logging()
+    remember_secrets(OAUTH_TOKEN.removeprefix("oauth:"), REFRESH_TOKEN, CLIENT_SECRET, DISCORD_WEBHOOK_URL,
+                     DASHBOARD_PASSWORD)
     if sys.argv[1:] == ["--test-discord"]:
         send_test_alert()
         return
@@ -878,9 +995,12 @@ def main():
     if not OAUTH_TOKEN:
         die("OAUTH_TOKEN is not set — see README.md")
 
-    store   = StatsStore(os.path.join(DATA_DIR, "lurkme.db"), log=lambda msg: print(msg, flush=True))
+    store = StatsStore(os.path.join(DATA_DIR, "lurkme.db"), log=lambda msg: print(msg, flush=True))
+    if not store.persistent:
+        print("[stats] Stats aren't being saved to disk, so they reset on restart. "
+              "On a VPS, run the installer again: sudo bash /opt/lurkme/deploy/install.sh", flush=True)
     seen    = store.get_meta("last_seen")
-    session = Session(store=store, previous_seen=float(seen) if seen else None)
+    session = Session(store=store, previous_seen=float(seen) if seen else None, alerts=_load_outbox(store))
 
     token         = OAUTH_TOKEN.removeprefix("oauth:")
     refresh_token = REFRESH_TOKEN
@@ -908,6 +1028,8 @@ def main():
         # Carry state into the next run — the token may have been refreshed meanwhile
         token, refresh_token = bot.user_token, bot.refresh_token
         session.restarts += 1
+        if session.down_since is None:
+            session.down_since = time.time()
         if time.monotonic() - started >= HEALTHY_RUN:
             delay = RESTART_DELAY_MIN
         print(f"[main] Restarting in {delay}s...", flush=True)

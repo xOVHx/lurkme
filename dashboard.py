@@ -177,9 +177,10 @@ async def _add_security_headers(request: web.Request, response: web.StreamRespon
     response.headers.update(SECURITY_HEADERS)
 
 def create_app(get_status: StatusGetter, password: str | None = None,
-               log: Callable[[str], None] = _print) -> web.Application:
+               log: Callable[[str], None] = _print, get_health: Callable[[], bool] | None = None) -> web.Application:
     """The dashboard. get_status() returns the status dict (LurkerBot.status_snapshot); it may also be async.
-    With a password, everything but /healthz needs HTTP Basic auth (any username)."""
+    With a password, everything but /healthz needs HTTP Basic auth (any username).
+    get_health() is a cheap "connected?" check for the unauthenticated /healthz; without it /healthz reads the full status."""
     secret  = password.encode("utf-8") if password else None
     lockout = _Lockout()
     logged: set[str] = set()
@@ -244,8 +245,11 @@ def create_app(get_status: StatusGetter, password: str | None = None,
 
     async def healthz(request: web.Request) -> web.Response:
         try:
-            bot       = (await read_status()).get("bot")
-            connected = isinstance(bot, dict) and bot.get("connected") is True
+            if get_health is not None:  # No database work for an endpoint anyone can hit
+                connected = get_health() is True
+            else:
+                bot       = (await read_status()).get("bot")
+                connected = isinstance(bot, dict) and bot.get("connected") is True
         except Exception as e:
             note(e)
             connected = False

@@ -196,6 +196,17 @@ class RoutesTest(DashboardCase):
             self.assert_security_headers(resp, "/healthz")
             await client.close()
 
+    async def test_healthz_uses_the_cheap_health_check_when_given(self):
+        status_calls = []
+        def get_status():
+            status_calls.append(1)
+            return sample_status(connected=True)
+        for health, code in ((lambda: True, 200), (lambda: False, 503), (lambda: "yes", 503), (lambda: 1 / 0, 503)):
+            client = await self.serve(get_status, get_health=health)
+            self.assertEqual((await client.get("/healthz")).status, code)
+            await client.close()
+        self.assertEqual(status_calls, [], "the unauthenticated /healthz must not build the full status")
+
     async def test_security_headers_on_every_response(self):
         client = await self.serve()
         for path in PATHS + ["/missing", "/api/status/../../etc/passwd"]:
